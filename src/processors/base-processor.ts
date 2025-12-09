@@ -365,10 +365,12 @@ export abstract class BaseProcessor {
       syncedAt: string;
     }
   ): Promise<void> {
+    const logPrefix = `[${this.getTypeName()}Processor]`;
+    
     try {
       const { data: dataModel, error: modelFetchError } = await this.supabase
         .from('data_models')
-        .select('id')
+        .select('id, model_kind')
         .eq('source_stream_id', streamId)
         .single();
       
@@ -390,12 +392,88 @@ export abstract class BaseProcessor {
         .eq('id', dataModel.id);
       
       if (modelUpdateError) {
-        console.warn(`[${this.getTypeName()}Processor] Failed to update data model:`, modelUpdateError);
+        console.warn(`${logPrefix} Failed to update data model:`, modelUpdateError);
       } else {
-        console.log(`[${this.getTypeName()}Processor] Updated data model ${dataModel.id} with parquet path`);
+        console.log(`${logPrefix} Updated data model ${dataModel.id} with parquet path`);
+        
+        // CASCADE REFRESH: Find and queue dependent derived models
+        // Only base models can have dependents (derived models don't have streams)
+        if (dataModel.model_kind === 'base' || dataModel.model_kind === 'staging') {
+          await this.triggerCascadeRefresh(dataModel.id);
+        }
       }
     } catch (error) {
-      console.error(`[${this.getTypeName()}Processor] Error updating data model:`, error);
+      console.error(`${logPrefix} Error updating data model:`, error);
+    }
+  }
+  
+  /**
+   * Trigger cascade refresh for derived models that depend on this base model
+   */
+  protected async triggerCascadeRefresh(baseModelId: string): Promise<void> {
+    const logPrefix = `[${this.getTypeName()}Processor]`;
+    
+    try {
+      // Find derived models that depend on this base model
+      const { data: dependentModels, error } = await this.supabase
+        .from('data_models')
+        .select('id, name, tenant_id')
+        .eq('model_kind', 'derived')
+        .contains('source_models', [baseModelId]);
+      
+      if (error) {
+        console.error(`${logPrefix} Error finding dependent models:`, error);
+        return;
+      }
+      
+      if (!dependentModels || dependentModels.length === 0) {
+        console.log(`${logPrefix} No dependent derived models found`);
+        return;
+      }
+      
+      console.log(`${logPrefix} Triggering cascade for ${dependentModels.length} dependent derived model(s)`);
+      
+      // Queue each dependent model for refresh
+      for (const derived of dependentModels) {
+        try {
+          await this.queueDerivedModelRefresh(
+            derived.id,
+            derived.tenant_id,
+            baseModelId
+          );
+          
+          console.log(`${logPrefix} Queued cascade refresh for: ${derived.name} (${derived.id})`);
+        } catch (queueError) {
+          console.error(`${logPrefix} Failed to queue ${derived.name}:`, queueError);
+          // Continue with other models even if one fails
+        }
+      }
+    } catch (error) {
+      console.error(`${logPrefix} Cascade refresh failed:`, error);
+      // Don't throw - cascade failure shouldn't fail the main sync
+    }
+  }
+  
+  /**
+   * Queue a derived model refresh job to PGMQ
+   */
+  protected async queueDerivedModelRefresh(
+    modelId: string,
+    tenantId: string,
+    triggeredBy: string
+  ): Promise<void> {
+    const { error } = await this.supabase.rpc('pgmq_send', {
+      queue_name: 'stream_sync_jobs_derived',
+      msg: JSON.stringify({
+        model_id: modelId,
+        tenant_id: tenantId,
+        triggered_by: triggeredBy,
+        trigger_type: 'cascade',
+      }),
+    });
+    
+    if (error) {
+      throw new Error(`Failed to queue derived model refresh: ${error.message}`);
     }
   }
   

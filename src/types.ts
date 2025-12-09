@@ -192,3 +192,213 @@ export interface DataMapping {
   data_stream_id: string;
   field_mappings: FieldMapping[];
 }
+
+// ============================================================================
+// DERIVED MODEL TYPES
+// ============================================================================
+
+/**
+ * Data model from database
+ */
+export interface DataModel {
+  id: string;
+  tenant_id: string;
+  name: string;
+  display_name?: string | null;
+  description?: string | null;
+  model_kind: 'base' | 'derived';
+  source_models?: string[] | null;  // UUIDs of source models for derived models
+  query_definition?: QueryDefinition | null;
+  schema?: SchemaField[] | null;
+  primary_key?: string[];
+  parquet_path?: string | null;
+  row_count?: number;
+  file_size_bytes?: number;
+  status?: string;
+  error_message?: string | null;
+  last_materialized_at?: string | null;
+  last_refresh_status?: string | null;
+  last_refresh_error?: string | null;
+  last_refresh_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Query definition for derived models (JSON DSL)
+ */
+export interface QueryDefinition {
+  type: 'join' | 'aggregation' | 'filter' | 'custom';
+  from?: string;  // Base model name to start from
+  select?: string[];  // Columns to select
+  joins?: JoinDefinition[];
+  where?: string;  // SQL WHERE clause
+  groupBy?: string[];
+  orderBy?: string[];
+  sql?: string;  // For custom SQL queries
+}
+
+/**
+ * Join definition in query
+ */
+export interface JoinDefinition {
+  type: 'INNER' | 'LEFT' | 'RIGHT' | 'FULL';
+  table: string;  // Model name to join
+  on: string;  // Join condition (SQL)
+}
+
+/**
+ * Derived model refresh job payload
+ */
+export interface DerivedModelJobPayload {
+  model_id: string;
+  tenant_id: string;
+  triggered_by?: string;  // Model ID that triggered this refresh
+  trigger_type?: 'manual' | 'scheduled' | 'cascade' | 'api';
+}
+
+/**
+ * Context for derived model processor
+ */
+export interface DerivedModelContext {
+  modelId: string;
+  tenantId: string;
+  dataModel: DataModel;
+}
+
+/**
+ * Result from derived model refresh
+ */
+export interface DerivedModelRefreshResult {
+  success: boolean;
+  parquetPath: string | null;
+  rowCount: number;
+  fileSize: number;
+  error?: string;
+}
+
+/**
+ * Source model info with parquet path
+ */
+export interface SourceModelInfo {
+  id: string;
+  name: string;
+  parquet_path: string;
+  tempPath?: string;
+}
+
+/**
+ * Manifest for derived model processing
+ */
+export interface DerivedModelManifest {
+  sourceModels: SourceModelInfo[];
+}
+
+// ============================================================================
+// OUTBOUND STREAM TYPES (Reverse ETL)
+// ============================================================================
+
+/**
+ * Output format for outbound streams
+ */
+export type OutputFormat = 'parquet' | 'csv' | 'json' | 'jsonl' | 'sql_insert';
+
+/**
+ * Trigger type for outbound jobs
+ */
+export type OutboundTriggerType = 'manual' | 'schedule' | 'api' | 'cascade';
+
+/**
+ * Outbound sync job payload from PGMQ queue
+ */
+export interface OutboundJobPayload {
+  stream_id: string;
+  tenant_id: string;
+  triggered_by?: OutboundTriggerType;
+  trigger_user_id?: string;
+  trigger_timestamp: string;
+}
+
+/**
+ * Outbound stream with target configuration
+ */
+export interface OutboundStream {
+  id: string;
+  name: string;
+  tenant_id: string;
+  direction: 'outbound' | 'bidirectional';
+  source_model_id: string;
+  target_data_source_id: string;
+  output_format: OutputFormat;
+  target_config?: SftpTargetConfig | DatabaseTargetConfig | ApiTargetConfig | null;
+  nested_data_mode?: 'flatten' | 'json' | 'expand';
+  include_header?: boolean;
+  csv_delimiter?: string;
+  status: string;
+}
+
+/**
+ * SFTP target configuration
+ */
+export interface SftpTargetConfig {
+  remotePath: string;
+  fileName?: string;
+  overwriteExisting?: boolean;
+  createDirectories?: boolean;
+  archiveAfterUpload?: boolean;
+}
+
+/**
+ * Database target configuration
+ */
+export interface DatabaseTargetConfig {
+  tableName: string;
+  schemaName?: string;
+  truncateFirst?: boolean;
+  upsertMode?: boolean;
+  upsertKeys?: string[];
+  primaryKey?: string[];
+  createIfNotExists?: boolean;
+  batchSize?: number;
+}
+
+/**
+ * API target configuration
+ */
+export interface ApiTargetConfig {
+  endpoint: string;
+  method: 'POST' | 'PUT' | 'PATCH';
+  headers?: Record<string, string>;
+  batchSize?: number;
+  payloadFormat?: 'array' | 'single' | 'wrapped';
+  wrapperKey?: string;
+  authType?: 'none' | 'bearer' | 'api_key' | 'basic';
+  authConfig?: Record<string, string>;
+}
+
+/**
+ * Context for outbound stream processor
+ */
+export interface OutboundStreamContext {
+  streamId: string;
+  tenantId: string;
+  jobId: string;
+  stream: OutboundStream;
+  sourceModel: DataModel;
+  targetDataSource: DataSource;
+}
+
+/**
+ * Result from outbound sync operation
+ */
+export interface OutboundSyncResult {
+  success: boolean;
+  stream_id: string;
+  job_id: string;
+  rows_exported: number;
+  bytes_written: number;
+  output_path?: string;
+  target_table?: string;
+  duration_ms: number;
+  error?: string;
+}

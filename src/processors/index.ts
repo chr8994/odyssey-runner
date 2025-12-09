@@ -68,3 +68,5 @@ export { BaseProcessor } from './base-processor.js';
 export { FileProcessor } from './file.js';
 export { SftpProcessor } from './sftp.js';
 export { MySqlProcessor } from './mysql.js';
+export { DerivedModelProcessor } from './derived-model.js';
+export { OutboundProcessor } from './outbound.js';

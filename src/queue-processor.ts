@@ -12,11 +12,13 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { config } from './config.js';
 import { SyncProcessor } from './sync-processor.js';
-import { PendingSyncJob, UpdateSyncRunStatusParams } from './types.js';
+import { DerivedModelJobProcessor } from './derived-model-processor.js';
+import { PendingSyncJob, UpdateSyncRunStatusParams, DerivedModelJobPayload } from './types.js';
 
 export class QueueProcessor {
   private supabase: SupabaseClient;
   private syncProcessor: SyncProcessor;
+  private derivedModelProcessor: DerivedModelJobProcessor;
   private isRunning = false;
   
   constructor() {
@@ -32,6 +34,7 @@ export class QueueProcessor {
     );
     
     this.syncProcessor = new SyncProcessor(this.supabase);
+    this.derivedModelProcessor = new DerivedModelJobProcessor(this.supabase);
   }
   
   /**
@@ -45,12 +48,16 @@ export class QueueProcessor {
     
     this.isRunning = true;
     console.log('[QueueProcessor] Starting queue processor...');
-    console.log(`[QueueProcessor] Queue: stream_sync_jobs`);
+    console.log(`[QueueProcessor] Queues: stream_sync_jobs, stream_sync_jobs_derived`);
     console.log(`[QueueProcessor] Batch size: ${config.queue.batchSize}`);
     console.log(`[QueueProcessor] Poll interval: ${config.queue.pollIntervalMs}ms`);
     console.log(`[QueueProcessor] Visibility timeout: ${config.queue.visibilityTimeoutSeconds}s`);
     
-    await this.runWorker();
+    // Run both workers in parallel
+    await Promise.all([
+      this.runSyncWorker(),
+      this.runDerivedModelWorker(),
+    ]);
   }
   
   /**
@@ -67,10 +74,10 @@ export class QueueProcessor {
   }
   
   /**
-   * Main worker loop - continuously polls for and processes jobs
+   * Stream sync worker loop - polls stream_sync_jobs queue
    */
-  private async runWorker(): Promise<void> {
-    console.log('[QueueProcessor] Worker started. Listening for sync jobs...');
+  private async runSyncWorker(): Promise<void> {
+    console.log('[QueueProcessor] Stream sync worker started. Listening for sync jobs...');
     
     while (this.isRunning) {
       try {
@@ -83,12 +90,12 @@ export class QueueProcessor {
           continue;
         }
         
-        console.log(`[QueueProcessor] Processing ${jobs.length} job(s)`);
+        console.log(`[SyncWorker] Processing ${jobs.length} job(s)`);
         
         // Process each job sequentially
         for (const job of jobs) {
           if (!this.isRunning) {
-            console.log('[QueueProcessor] Shutdown requested, stopping job processing');
+            console.log('[SyncWorker] Shutdown requested, stopping job processing');
             break;
           }
           
@@ -99,7 +106,56 @@ export class QueueProcessor {
         await this.delay(1000);
         
       } catch (error) {
-        console.error('[QueueProcessor] Worker error:', error);
+        console.error('[SyncWorker] Worker error:', error);
+        await this.delay(config.queue.pollIntervalMs);
+      }
+    }
+  }
+  
+  /**
+   * Derived model worker loop - polls stream_sync_jobs_derived queue
+   */
+  private async runDerivedModelWorker(): Promise<void> {
+    console.log('[QueueProcessor] Derived model worker started. Listening for derived model jobs...');
+    
+    while (this.isRunning) {
+      try {
+        // Fetch messages from derived model queue
+        const { data: messages, error } = await this.supabase.rpc('pgmq_read', {
+          queue_name: 'stream_sync_jobs_derived',
+          vt: config.queue.visibilityTimeoutSeconds,
+          qty: config.queue.batchSize,
+        });
+        
+        if (error) {
+          console.error('[DerivedModelWorker] Error reading queue:', error);
+          await this.delay(config.queue.pollIntervalMs);
+          continue;
+        }
+        
+        if (!messages || messages.length === 0) {
+          // No jobs available, wait and poll again
+          await this.delay(config.queue.pollIntervalMs);
+          continue;
+        }
+        
+        console.log(`[DerivedModelWorker] Processing ${messages.length} derived model job(s)`);
+        
+        // Process each job sequentially
+        for (const msg of messages) {
+          if (!this.isRunning) {
+            console.log('[DerivedModelWorker] Shutdown requested, stopping job processing');
+            break;
+          }
+          
+          await this.processDerivedModelJob(msg.msg_id, msg.message);
+        }
+        
+        // Small delay between batches
+        await this.delay(1000);
+        
+      } catch (error) {
+        console.error('[DerivedModelWorker] Worker error:', error);
         await this.delay(config.queue.pollIntervalMs);
       }
     }
@@ -209,6 +265,51 @@ export class QueueProcessor {
   }
   
   /**
+   * Process a single derived model refresh job
+   */
+  private async processDerivedModelJob(msgId: number, message: string): Promise<void> {
+    const startTime = Date.now();
+    
+    try {
+      // Parse job payload
+      const job: DerivedModelJobPayload = JSON.parse(message);
+      
+      console.log('═══════════════════════════════════════════════');
+      console.log(`[DerivedModelWorker] Job started: ${job.model_id}`);
+      console.log(`[DerivedModelWorker] Tenant: ${job.tenant_id}`);
+      console.log(`[DerivedModelWorker] Triggered by: ${job.triggered_by || 'manual'}`);
+      console.log(`[DerivedModelWorker] Trigger type: ${job.trigger_type || 'manual'}`);
+      console.log('═══════════════════════════════════════════════');
+      
+      // Execute the derived model refresh
+      const result = await this.derivedModelProcessor.process(job);
+      
+      const duration = Date.now() - startTime;
+      
+      if (result.success) {
+        // Archive the message (mark as processed)
+        await this.acknowledgeDerivedModelJob(msgId);
+        console.log(`[DerivedModelWorker] ✓ Refresh completed in ${duration}ms: ${job.model_id}`);
+      } else {
+        // Archive the message even on failure to prevent infinite retries
+        // (the failure is recorded in data_models.last_refresh_error)
+        await this.acknowledgeDerivedModelJob(msgId);
+        console.log(`[DerivedModelWorker] ✗ Refresh failed after ${duration}ms: ${job.model_id}`);
+        console.log(`[DerivedModelWorker] Error: ${result.error}`);
+      }
+      
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      
+      console.error(`[DerivedModelWorker] Job error after ${duration}ms:`, error);
+      
+      // Archive to prevent infinite retries
+      await this.acknowledgeDerivedModelJob(msgId);
+    }
+  }
+  
+  /**
    * Update the status of a sync run
    */
   private async updateSyncRunStatus(params: UpdateSyncRunStatusParams): Promise<void> {
@@ -241,6 +342,29 @@ export class QueueProcessor {
       
     } catch (error) {
       console.error('[QueueProcessor] Error in acknowledgeJob:', error);
+      return false;
+    }
+  }
+  
+  /**
+   * Archive a derived model job (remove from queue)
+   */
+  private async acknowledgeDerivedModelJob(msgId: number): Promise<boolean> {
+    try {
+      const { data, error } = await this.supabase.rpc('pgmq_archive', {
+        queue_name: 'stream_sync_jobs_derived',
+        msg_id: msgId,
+      });
+      
+      if (error) {
+        console.error('[DerivedModelWorker] Error archiving job:', error);
+        return false;
+      }
+      
+      return data === true;
+      
+    } catch (error) {
+      console.error('[DerivedModelWorker] Error in acknowledgeDerivedModelJob:', error);
       return false;
     }
   }
