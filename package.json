@@ -1,0 +1,40 @@
+{
+  "name": "odyssey-runner",
+  "version": "1.0.0",
+  "description": "Stream Runner Service - Background worker for data stream synchronization",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "stream",
+    "runner",
+    "pgmq",
+    "supabase",
+    "worker"
+  ],
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@duckdb/node-api": "^1.4.2-r.1",
+    "@supabase/supabase-js": "^2.49.1",
+    "dotenv": "^16.4.7",
+    "ssh2": "^1.16.0",
+    "ssh2-sftp-client": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ssh2": "^1.15.1",
+    "@types/ssh2-sftp-client": "^9.0.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,80 @@
+# Odyssey Runner Service - Docker Compose Configuration
+# 
+# Usage:
+#   Development: docker compose up
+#   Production:  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+version: '3.8'
+
+services:
+  odyssey-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: odyssey-runner
+    
+    # Environment variables (override with .env file or docker-compose.override.yml)
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - POLL_INTERVAL_MS=${POLL_INTERVAL_MS:-5000}
+      - BATCH_SIZE=${BATCH_SIZE:-5}
+      - VISIBILITY_TIMEOUT_SECONDS=${VISIBILITY_TIMEOUT_SECONDS:-300}
+      - MAX_RETRIES=${MAX_RETRIES:-3}
+      - HEALTH_CHECK_ENABLED=${HEALTH_CHECK_ENABLED:-true}
+      - HEALTH_CHECK_PORT=${HEALTH_CHECK_PORT:-8080}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    
+    # Health check port
+    ports:
+      - "${HEALTH_CHECK_PORT:-8080}:8080"
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Resource limits (adjust based on workload)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Optional: Multiple workers for horizontal scaling
+# Uncomment and adjust for production
+#
+#   odyssey-runner-2:
+#     extends:
+#       service: odyssey-runner
+#     container_name: odyssey-runner-2
+#     ports:
+#       - "8081:8080"
+#
+#   odyssey-runner-3:
+#     extends:
+#       service: odyssey-runner
+#     container_name: odyssey-runner-3
+#     ports:
+#       - "8082:8080"
+
+networks:
+  default:
+    name: odyssey-network
