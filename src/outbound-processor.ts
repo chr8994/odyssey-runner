@@ -7,6 +7,7 @@
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { OutboundProcessor } from './processors/outbound.js';
+import { config } from './config.js';
 import {
   OutboundJobPayload,
   OutboundStreamContext,
@@ -18,6 +19,7 @@ import {
 const QUEUE_NAME = 'stream_sync_jobs_outbound';
 const POLL_INTERVAL_MS = 5000; // Poll every 5 seconds
 const VIS_TIMEOUT_SECONDS = 300; // 5 minutes visibility timeout
+const MAX_RETRIES = config.queue.maxRetries; // Default: 3
 
 export class OutboundQueueProcessor {
   private supabase: SupabaseClient;
@@ -67,17 +69,17 @@ export class OutboundQueueProcessor {
     
     try {
       // Read message from queue
-      const { data: messages, error } = await this.supabase.rpc('pgmq_read', {
+      const { data: messages, error } = await this.supabase.rpc('nova_pgmq_read', {
         queue_name: QUEUE_NAME,
-        vt: VIS_TIMEOUT_SECONDS,
-        qty: 1,
+        visibility_timeout: VIS_TIMEOUT_SECONDS,
+        quantity: 1,
       });
       
       if (error) {
         console.error('[OutboundQueueProcessor] Error reading from queue:', error);
       } else if (messages && messages.length > 0) {
         const message = messages[0];
-        await this.processJob(message.msg_id, message.message);
+        await this.processJob(message.msg_id, message.message, message.read_ct);
       }
     } catch (error) {
       console.error('[OutboundQueueProcessor] Error in poll cycle:', error);
@@ -92,21 +94,63 @@ export class OutboundQueueProcessor {
   /**
    * Process a single outbound job
    */
-  private async processJob(msgId: number, payload: OutboundJobPayload): Promise<void> {
+  private async processJob(msgId: number, payload: OutboundJobPayload, readCount: number): Promise<void> {
     const { stream_id, tenant_id } = payload;
     
-    console.log(`[OutboundQueueProcessor] Processing job ${msgId} for stream: ${stream_id}`);
+    console.log(`[OutboundQueueProcessor] Processing job ${msgId} for stream: ${stream_id} (attempt ${readCount}/${MAX_RETRIES})`);
+    
+    // Check if max retries exceeded
+    if (readCount > MAX_RETRIES) {
+      console.log(`[OutboundQueueProcessor] Job ${msgId} exceeded max retries (${readCount}/${MAX_RETRIES}) - DELETING permanently`);
+      
+      // Update job status to indicate max retries exceeded
+      await this.updateJobStatus(
+        stream_id,
+        msgId.toString(),
+        'failed',
+        `Max retries exceeded (${readCount}/${MAX_RETRIES})`
+      );
+      
+      // DELETE the message permanently (not archive - delete removes it entirely from PGMQ)
+      const { error: deleteError } = await this.supabase.rpc('nova_pgmq_delete', {
+        queue_name: QUEUE_NAME,
+        msg_id: msgId,
+      });
+      
+      if (deleteError) {
+        console.error(`[OutboundQueueProcessor] Failed to delete job ${msgId}:`, deleteError);
+      } else {
+        console.log(`[OutboundQueueProcessor] Job ${msgId} DELETED permanently - max retries exceeded`);
+      }
+      return;
+    }
     
     try {
-      // Update job status to 'running'
-      await this.updateJobStatus(stream_id, msgId.toString(), 'running');
+      // Fetch stream with related data - check if stream exists first
+      const contextResult = await this.buildContext(stream_id, tenant_id, msgId.toString());
       
-      // Fetch stream with related data
-      const context = await this.buildContext(stream_id, tenant_id, msgId.toString());
+      // Handle stream-not-found case - don't retry, just archive
+      if (contextResult.notFound) {
+        console.log(`[OutboundQueueProcessor] Stream ${stream_id} not found - archiving job ${msgId} (stream was deleted)`);
+        
+        // Archive the message immediately without retry
+        await this.supabase.rpc('nova_pgmq_archive', {
+          queue_name: QUEUE_NAME,
+          msg_id: msgId,
+        });
+        
+        console.log(`[OutboundQueueProcessor] Job ${msgId} archived - stream was deleted`);
+        return;
+      }
       
-      if (!context) {
+      if (!contextResult.context) {
         throw new Error('Failed to build context');
       }
+      
+      const context = contextResult.context;
+      
+      // Update job status to 'running'
+      await this.updateJobStatus(stream_id, msgId.toString(), 'running');
       
       // Execute outbound sync
       const result = await this.processor.process(context);
@@ -127,7 +171,7 @@ export class OutboundQueueProcessor {
         );
         
         // Delete message from queue (acknowledge)
-        await this.supabase.rpc('pgmq_delete', {
+        await this.supabase.rpc('nova_pgmq_delete', {
           queue_name: QUEUE_NAME,
           msg_id: msgId,
         });
@@ -143,7 +187,7 @@ export class OutboundQueueProcessor {
         );
         
         // Archive the message (move to dead letter queue)
-        await this.supabase.rpc('pgmq_archive', {
+        await this.supabase.rpc('nova_pgmq_archive', {
           queue_name: QUEUE_NAME,
           msg_id: msgId,
         });
@@ -161,7 +205,7 @@ export class OutboundQueueProcessor {
       );
       
       // Archive the message
-      await this.supabase.rpc('pgmq_archive', {
+      await this.supabase.rpc('nova_pgmq_archive', {
         queue_name: QUEUE_NAME,
         msg_id: msgId,
       });
@@ -170,12 +214,14 @@ export class OutboundQueueProcessor {
   
   /**
    * Build execution context for outbound processor
+   * Returns an object with context and notFound flag to distinguish between
+   * "stream doesn't exist" (should archive) vs "other error" (may retry)
    */
   private async buildContext(
     streamId: string,
     tenantId: string,
     jobId: string
-  ): Promise<OutboundStreamContext | null> {
+  ): Promise<{ context: OutboundStreamContext | null; notFound: boolean }> {
     try {
       // Fetch stream with related entities
       const { data: stream, error: streamError } = await this.supabase
@@ -188,38 +234,47 @@ export class OutboundQueueProcessor {
         .eq('id', streamId)
         .single();
       
-      if (streamError || !stream) {
+      // Check if stream doesn't exist - this is a "not found" case
+      if (streamError?.code === 'PGRST116' || !stream) {
+        console.log('[OutboundQueueProcessor] Stream not found:', streamId);
+        return { context: null, notFound: true };
+      }
+      
+      if (streamError) {
         console.error('[OutboundQueueProcessor] Error fetching stream:', streamError);
-        return null;
+        return { context: null, notFound: false };
       }
       
       // Validate outbound stream
       if (stream.direction !== 'outbound' && stream.direction !== 'bidirectional') {
         console.error('[OutboundQueueProcessor] Stream is not outbound:', stream.direction);
-        return null;
+        return { context: null, notFound: false };
       }
       
       if (!stream.source_model) {
         console.error('[OutboundQueueProcessor] Stream has no source model');
-        return null;
+        return { context: null, notFound: false };
       }
       
       if (!stream.target_data_source) {
         console.error('[OutboundQueueProcessor] Stream has no target data source');
-        return null;
+        return { context: null, notFound: false };
       }
       
       return {
-        streamId,
-        tenantId,
-        jobId,
-        stream: stream as OutboundStream,
-        sourceModel: stream.source_model as DataModel,
-        targetDataSource: stream.target_data_source as DataSource,
+        context: {
+          streamId,
+          tenantId,
+          jobId,
+          stream: stream as OutboundStream,
+          sourceModel: stream.source_model as DataModel,
+          targetDataSource: stream.target_data_source as DataSource,
+        },
+        notFound: false,
       };
     } catch (error) {
       console.error('[OutboundQueueProcessor] Error building context:', error);
-      return null;
+      return { context: null, notFound: false };
     }
   }
   

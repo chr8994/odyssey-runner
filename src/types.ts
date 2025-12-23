@@ -44,6 +44,18 @@ export interface SyncResult {
   rowCount: number;
   fileSize: number;
   error?: string;
+  /** Partition info if file was split into multiple parts */
+  partitions?: PartitionInfo[];
+}
+
+/**
+ * Information about a file partition
+ */
+export interface PartitionInfo {
+  partNumber: number;
+  path: string;
+  rowCount: number;
+  fileSize: number;
 }
 
 /**
@@ -86,6 +98,12 @@ export interface DataStream {
   source_data_source_id: string | null;
   status: string;
   data_source?: DataSource;
+  /** Primary key columns for CDC tracking */
+  primary_key?: string[];
+  /** Sync mode: full_refresh or incremental */
+  sync_mode?: 'full_refresh' | 'incremental';
+  /** Cursor field for incremental syncs and $_last_updated tracking */
+  cursor_field?: string;
 }
 
 /**
@@ -242,9 +260,10 @@ export interface QueryDefinition {
  * Join definition in query
  */
 export interface JoinDefinition {
-  type: 'INNER' | 'LEFT' | 'RIGHT' | 'FULL';
-  table: string;  // Model name to join
-  on: string;  // Join condition (SQL)
+  type: 'INNER' | 'LEFT' | 'RIGHT' | 'FULL' | 'left' | 'right' | 'inner' | 'full';
+  table?: string;  // Model name to join (preferred)
+  model?: string;  // Alternative: Model name to join (for backwards compatibility)
+  on: string | [string, string];  // Join condition (SQL string or [leftCol, rightCol] array)
 }
 
 /**
@@ -400,5 +419,126 @@ export interface OutboundSyncResult {
   output_path?: string;
   target_table?: string;
   duration_ms: number;
+  error?: string;
+}
+
+// ============================================================================
+// PARTITION TYPES (User-Scoped Database Partitions)
+// ============================================================================
+
+/**
+ * Trigger type for partition build jobs
+ */
+export type PartitionTriggerType = 'manual' | 'scheduled' | 'model_updated' | 'on_demand';
+
+/**
+ * Priority levels for partition builds
+ */
+export type PartitionPriority = 'high' | 'normal' | 'low';
+
+/**
+ * Status of a partition database
+ */
+export type PartitionDatabaseStatus = 'pending' | 'building' | 'ready' | 'stale' | 'failed';
+
+/**
+ * Partition build job payload from PGMQ queue
+ */
+export interface PartitionBuildJob {
+  partition_rule_id: string;
+  partition_value: string;
+  tenant_id: string;
+  rule_name: string;
+  trigger_type: PartitionTriggerType;
+  priority?: PartitionPriority;
+  queued_at?: string;
+}
+
+/**
+ * Partition rule configuration from database
+ */
+export interface PartitionRule {
+  id: string;
+  tenant_id: string;
+  name: string;
+  slug: string;
+  description?: string | null;
+  partition_column: string;
+  refresh_strategy: 'on_demand' | 'scheduled' | 'on_update';
+  cron_schedule?: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Model mapping in a partition rule
+ */
+export interface PartitionRuleModelMapping {
+  id: string;
+  partition_rule_id: string;
+  data_model_id: string;
+  table_alias?: string | null;
+  is_primary: boolean;
+  join_config?: PartitionJoinConfig | null;
+  created_at: string;
+}
+
+/**
+ * Join configuration for non-primary models
+ */
+export interface PartitionJoinConfig {
+  type: 'INNER' | 'LEFT' | 'RIGHT' | 'FULL';
+  foreignKey: string;
+  primaryKey: string;
+}
+
+/**
+ * Partition database record
+ */
+export interface PartitionDatabase {
+  id: string;
+  partition_rule_id: string;
+  tenant_id: string;
+  partition_value: string;
+  storage_path?: string | null;
+  status: PartitionDatabaseStatus;
+  total_rows?: number | null;
+  file_size_bytes?: number | null;
+  build_started_at?: string | null;
+  build_completed_at?: string | null;
+  last_built_at?: string | null;
+  error_message?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Context for partition builder
+ */
+export interface PartitionBuildContext {
+  ruleId: string;
+  partitionValue: string;
+  tenantId: string;
+  rule: PartitionRule;
+  modelMappings: PartitionRuleModelMappingWithModel[];
+}
+
+/**
+ * Model mapping with the full data model attached
+ */
+export interface PartitionRuleModelMappingWithModel extends PartitionRuleModelMapping {
+  data_model: DataModel;
+}
+
+/**
+ * Result from partition build operation
+ */
+export interface PartitionBuildResult {
+  success: boolean;
+  databasePath: string | null;
+  totalRows: number;
+  fileSize: number;
+  tablesIncluded: string[];
   error?: string;
 }

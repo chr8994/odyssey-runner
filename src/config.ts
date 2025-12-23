@@ -3,6 +3,10 @@
  * Loads and validates environment variables
  */
 
+// Load .env file FIRST before reading any environment variables
+import dotenv from 'dotenv';
+dotenv.config();
+
 export interface Config {
   /**
    * Node environment
@@ -65,8 +69,8 @@ function loadConfig(): Config {
     nodeEnv: process.env.NODE_ENV || 'development',
     
     supabase: {
-      url: process.env.SUPABASE_URL || '',
-      serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
+      url: process.env.ORCHESTRATOR_SUPABASE_URL || '',
+      serviceKey: process.env.ORCHESTRATOR_SUPABASE_SERVICE_ROLE_KEY || '',
     },
     
     queue: {
@@ -93,11 +97,11 @@ export function validateConfig(): void {
   const missingVars: string[] = [];
   
   if (!config.supabase.url) {
-    missingVars.push('SUPABASE_URL');
+    missingVars.push('ORCHESTRATOR_SUPABASE_URL');
   }
   
   if (!config.supabase.serviceKey) {
-    missingVars.push('SUPABASE_SERVICE_ROLE_KEY');
+    missingVars.push('ORCHESTRATOR_SUPABASE_SERVICE_ROLE_KEY');
   }
   
   if (missingVars.length > 0) {

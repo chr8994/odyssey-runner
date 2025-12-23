@@ -1,13 +1,22 @@
 {
   "name": "odyssey-runner",
   "version": "1.0.0",
-  "description": "Stream Runner Service - Background worker for data stream synchronization",
+  "description": "Odyssey Runner Service - Background workers for data processing",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts",
+    "start": "node dist/runners/sync.js",
+    "dev": "tsx watch src/runners/sync.ts",
+    "sync": "tsx src/runners/sync.ts --",
+    "sync:dev": "tsx watch src/runners/sync.ts",
+    "sync:prod": "node dist/runners/sync.js",
+    "outbound": "tsx src/runners/outbound.ts --",
+    "outbound:dev": "tsx watch src/runners/outbound.ts",
+    "outbound:prod": "node dist/runners/outbound.js",
+    "partitions": "tsx src/runners/partitions.ts --",
+    "partitions:dev": "tsx watch src/runners/partitions.ts",
+    "partitions:prod": "node dist/runners/partitions.js",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist"
   },
@@ -16,7 +25,9 @@
     "runner",
     "pgmq",
     "supabase",
-    "worker"
+    "worker",
+    "partition",
+    "etl"
   ],
   "author": "",
   "license": "UNLICENSED",
@@ -24,6 +35,7 @@
     "@duckdb/node-api": "^1.4.2-r.1",
     "@supabase/supabase-js": "^2.49.1",
     "dotenv": "^16.4.7",
+    "mysql2": "^3.14.0",
     "ssh2": "^1.16.0",
     "ssh2-sftp-client": "^11.0.0"
   },

@@ -120,11 +120,11 @@ export class QueueProcessor {
     
     while (this.isRunning) {
       try {
-        // Fetch messages from derived model queue
-        const { data: messages, error } = await this.supabase.rpc('pgmq_read', {
+        // Fetch messages from derived model queue using nova wrapper
+        const { data: messages, error } = await this.supabase.rpc('nova_pgmq_read', {
           queue_name: 'stream_sync_jobs_derived',
-          vt: config.queue.visibilityTimeoutSeconds,
-          qty: config.queue.batchSize,
+          visibility_timeout: config.queue.visibilityTimeoutSeconds,
+          quantity: config.queue.batchSize,
         });
         
         if (error) {
@@ -267,12 +267,12 @@ export class QueueProcessor {
   /**
    * Process a single derived model refresh job
    */
-  private async processDerivedModelJob(msgId: number, message: string): Promise<void> {
+  private async processDerivedModelJob(msgId: number, message: any): Promise<void> {
     const startTime = Date.now();
     
     try {
-      // Parse job payload
-      const job: DerivedModelJobPayload = JSON.parse(message);
+      // Message is already an object from PGMQ (JSONB type)
+      const job: DerivedModelJobPayload = message as DerivedModelJobPayload;
       
       console.log('═══════════════════════════════════════════════');
       console.log(`[DerivedModelWorker] Job started: ${job.model_id}`);
@@ -347,17 +347,17 @@ export class QueueProcessor {
   }
   
   /**
-   * Archive a derived model job (remove from queue)
+   * Delete a derived model job (remove from queue) using nova wrapper
    */
   private async acknowledgeDerivedModelJob(msgId: number): Promise<boolean> {
     try {
-      const { data, error } = await this.supabase.rpc('pgmq_archive', {
+      const { data, error } = await this.supabase.rpc('nova_pgmq_delete', {
         queue_name: 'stream_sync_jobs_derived',
         msg_id: msgId,
       });
       
       if (error) {
-        console.error('[DerivedModelWorker] Error archiving job:', error);
+        console.error('[DerivedModelWorker] Error deleting job:', error);
         return false;
       }
       

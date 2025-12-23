@@ -15,6 +15,7 @@ import { SupabaseClient } from '@supabase/supabase-js';
 import { DuckDBInstance } from '@duckdb/node-api';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import {
   DerivedModelContext,
   DerivedModelRefreshResult,
@@ -35,7 +36,7 @@ export class DerivedModelProcessor {
   
   constructor(supabase: SupabaseClient) {
     this.supabase = supabase;
-    this.tempDir = require('os').tmpdir();
+    this.tempDir = os.tmpdir();
   }
   
   /**
@@ -106,23 +107,52 @@ export class DerivedModelProcessor {
       );
       tempFiles.push(parquetPath);
       
-      // Step 5: Upload to streams bucket
+      // Step 5: Upload to streams bucket using stream to avoid size limits
       const parquetStoragePath = `${context.tenantId}/${context.modelId}.parquet`;
-      const parquetBuffer = fs.readFileSync(parquetPath);
       
-      const { error: uploadError } = await this.supabase
-        .storage
-        .from('streams')
-        .upload(parquetStoragePath, parquetBuffer, {
-          contentType: 'application/x-parquet',
-          upsert: true,
+      console.log(`${logPrefix} ========== UPLOAD DEBUG INFO ==========`);
+      console.log(`${logPrefix} File path: ${parquetPath}`);
+      console.log(`${logPrefix} File size: ${fileSize} bytes (${(fileSize / 1024 / 1024).toFixed(2)} MB)`);
+      console.log(`${logPrefix} Storage path: ${parquetStoragePath}`);
+      console.log(`${logPrefix} Using stream upload: true`);
+      
+      const parquetStream = fs.createReadStream(parquetPath);
+      console.log(`${logPrefix} Stream created successfully`);
+      
+      try {
+        console.log(`${logPrefix} Starting upload to Supabase Storage...`);
+        const uploadResult = await this.supabase
+          .storage
+          .from('streams')
+          .upload(parquetStoragePath, parquetStream, {
+            contentType: 'application/x-parquet',
+            upsert: true,
+          });
+        
+        console.log(`${logPrefix} Upload result:`, {
+          hasError: !!uploadResult.error,
+          hasData: !!uploadResult.data,
+          error: uploadResult.error ? {
+            name: uploadResult.error.name,
+            message: uploadResult.error.message,
+            statusCode: (uploadResult.error as any).statusCode,
+            fullError: uploadResult.error
+          } : null
         });
-      
-      if (uploadError) {
-        throw new Error(`Failed to upload parquet: ${uploadError.message}`);
+        
+        if (uploadResult.error) {
+          throw new Error(`Failed to upload parquet: ${uploadResult.error.message}`);
+        }
+        
+        console.log(`${logPrefix} ========== UPLOAD SUCCESS ==========`);
+        console.log(`${logPrefix} Uploaded to streams/${parquetStoragePath}`);
+        
+      } catch (uploadException) {
+        console.error(`${logPrefix} ========== UPLOAD EXCEPTION ==========`);
+        console.error(`${logPrefix} Exception type:`, uploadException instanceof Error ? uploadException.constructor.name : typeof uploadException);
+        console.error(`${logPrefix} Exception details:`, uploadException);
+        throw uploadException;
       }
-      
-      console.log(`${logPrefix} Uploaded to streams/${parquetStoragePath}`);
       
       const refreshedAt = new Date().toISOString();
       
@@ -232,7 +262,8 @@ export class DerivedModelProcessor {
   private async processWithDuckDB(
     sourceModels: SourceModelInfo[],
     queryDef: QueryDefinition,
-    context: DerivedModelContext
+    context: DerivedModelContext,
+    tempFiles: string[] = []
   ): Promise<{ parquetPath: string; rowCount: number; fileSize: number }> {
     const logPrefix = '[DerivedModelProcessor]';
     
@@ -279,9 +310,97 @@ export class DerivedModelProcessor {
       
       console.log(`${logPrefix} Added $_ref hash column for CDC tracking`);
       
+      // Implement CDC: Compare with previous version to detect changes
+      let selectWithCDC: string;
+      
+      if (context.dataModel.parquet_path) {
+        // Previous version exists - implement CDC
+        console.log(`${logPrefix} Previous parquet exists, implementing CDC...`);
+        
+        try {
+          // Download previous parquet
+          const { data: prevData, error: prevError } = await this.supabase
+            .storage
+            .from('streams')
+            .download(context.dataModel.parquet_path);
+          
+          if (!prevError && prevData) {
+            const prevTempPath = this.getTempFilePath('previous', `${context.modelId}.parquet`);
+            const prevBuffer = Buffer.from(await prevData.arrayBuffer());
+            fs.writeFileSync(prevTempPath, prevBuffer);
+            tempFiles.push(prevTempPath);
+            
+            const escapedPrevPath = prevTempPath.replace(/'/g, "''");
+            await connection.run(`
+              CREATE TABLE previous_data AS 
+              SELECT * FROM read_parquet('${escapedPrevPath}')
+            `);
+            
+            console.log(`${logPrefix} Loaded previous version for CDC comparison`);
+            
+            // CDC Detection Query
+            selectWithCDC = `
+              WITH new_data AS (
+                ${selectWithHash}
+              ),
+              -- Detect INSERT: rows in new but not in previous
+              inserts AS (
+                SELECT 
+                  *,
+                  'INSERT' AS "${SYSTEM_COLUMN_PREFIX}operation",
+                  CURRENT_TIMESTAMP AS "${SYSTEM_COLUMN_PREFIX}timestamp",
+                  CURRENT_TIMESTAMP AS "${SYSTEM_COLUMN_PREFIX}last_updated"
+                FROM new_data
+                WHERE "${SYSTEM_COLUMN_PREFIX}ref" NOT IN (SELECT "${SYSTEM_COLUMN_PREFIX}ref" FROM previous_data)
+              ),
+              -- Unchanged rows: data hasn't changed (same $_ref hash)
+              -- Mark as INSERT and preserve original timestamps since data is unchanged
+              unchanged AS (
+                SELECT 
+                  new_data.*,
+                  'INSERT' AS "${SYSTEM_COLUMN_PREFIX}operation",
+                  previous_data."${SYSTEM_COLUMN_PREFIX}timestamp",
+                  previous_data."${SYSTEM_COLUMN_PREFIX}last_updated"
+                FROM new_data
+                INNER JOIN previous_data ON new_data."${SYSTEM_COLUMN_PREFIX}ref" = previous_data."${SYSTEM_COLUMN_PREFIX}ref"
+              ),
+              -- Detect DELETE: rows in previous but not in new
+              deletes AS (
+                SELECT 
+                  *,
+                  'DELETE' AS "${SYSTEM_COLUMN_PREFIX}operation",
+                  "${SYSTEM_COLUMN_PREFIX}timestamp",
+                  CURRENT_TIMESTAMP AS "${SYSTEM_COLUMN_PREFIX}last_updated"
+                FROM previous_data
+                WHERE "${SYSTEM_COLUMN_PREFIX}ref" NOT IN (SELECT "${SYSTEM_COLUMN_PREFIX}ref" FROM new_data)
+              )
+              -- Combine all changes
+              SELECT * FROM inserts
+              UNION ALL
+              SELECT * FROM unchanged
+              UNION ALL
+              SELECT * FROM deletes
+            `;
+            
+            console.log(`${logPrefix} CDC detection: INSERT/UPDATE/DELETE operations calculated`);
+          } else {
+            // Failed to download previous version, treat as first refresh
+            console.warn(`${logPrefix} Failed to download previous version, treating as first refresh`);
+            selectWithCDC = this.buildFirstRefreshQuery(selectWithHash);
+          }
+        } catch (error) {
+          console.warn(`${logPrefix} Error loading previous version, treating as first refresh:`, error);
+          selectWithCDC = this.buildFirstRefreshQuery(selectWithHash);
+        }
+      } else {
+        // First refresh - all rows are INSERT
+        console.log(`${logPrefix} First refresh - all rows marked as INSERT`);
+        selectWithCDC = this.buildFirstRefreshQuery(selectWithHash);
+      }
+      
       // Get row count
       const countReader = await connection.runAndReadAll(
-        `SELECT COUNT(*) as count FROM (${selectWithHash}) t`
+        `SELECT COUNT(*) as count FROM (${selectWithCDC}) t`
       );
       const rowCount = Number(countReader.getRows()[0]?.[0] || 0);
       console.log(`${logPrefix} Row count: ${rowCount}`);
@@ -289,7 +408,7 @@ export class DerivedModelProcessor {
       // Export to parquet
       const tempParquetPath = path.join(this.tempDir, `${context.modelId}.parquet`);
       const escapedParquetPath = tempParquetPath.replace(/'/g, "''");
-      const exportQuery = `COPY (${selectWithHash}) TO '${escapedParquetPath}' (FORMAT PARQUET, COMPRESSION 'SNAPPY')`;
+      const exportQuery = `COPY (${selectWithCDC}) TO '${escapedParquetPath}' (FORMAT PARQUET, COMPRESSION 'SNAPPY')`;
       await connection.run(exportQuery);
       
       const fileSize = fs.statSync(tempParquetPath).size;
@@ -323,8 +442,48 @@ export class DerivedModelProcessor {
       // Add joins
       if (queryDef.joins && queryDef.joins.length > 0) {
         for (const join of queryDef.joins) {
-          const joinTable = this.sanitizeTableName(join.table);
-          sql += ` ${join.type} JOIN ${joinTable} ON ${join.on}`;
+          // Support both "table" and "model" properties for table name
+          const tableName = join.table || join.model;
+          if (!tableName) {
+            throw new Error(`Join is missing table/model name: ${JSON.stringify(join)}`);
+          }
+          
+          // Sanitize the join's table name
+          const sanitizedJoinName = this.sanitizeTableName(tableName);
+          
+          // Match against source models to find the actual table name
+          // This handles cases where display name (e.g., "Nhc Users") doesn't match
+          // the actual model name (e.g., "nhc_users_model")
+          const matchedModel = sourceModels.find(model => {
+            const sanitizedModelName = this.sanitizeTableName(model.name);
+            // Check if sanitized names match, or if join name is a substring
+            return sanitizedModelName === sanitizedJoinName || 
+                   sanitizedModelName.includes(sanitizedJoinName) ||
+                   sanitizedJoinName.includes(sanitizedModelName);
+          });
+          
+          // Use the matched model's sanitized name, or fall back to the sanitized join name
+          const joinTable = matchedModel 
+            ? this.sanitizeTableName(matchedModel.name)
+            : sanitizedJoinName;
+          
+          // Handle join.on as either string or array [leftCol, rightCol]
+          let joinCondition: string;
+          if (Array.isArray(join.on)) {
+            // Array format: ["user_id", "user_id"] → "fromTable.user_id = joinTable.user_id"
+            if (join.on.length !== 2) {
+              throw new Error(`Join condition array must have exactly 2 elements, got: ${JSON.stringify(join.on)}`);
+            }
+            const leftCol = join.on[0];
+            const rightCol = join.on[1];
+            // Qualify left column with FROM table to avoid ambiguity
+            joinCondition = `${fromTable}."${leftCol}" = ${joinTable}."${rightCol}"`;
+          } else {
+            // String format: already a SQL condition
+            joinCondition = join.on;
+          }
+          
+          sql += ` ${join.type} JOIN ${joinTable} ON ${joinCondition}`;
         }
       }
       
@@ -347,6 +506,20 @@ export class DerivedModelProcessor {
     }
     
     throw new Error(`Unsupported query type: ${queryDef.type}`);
+  }
+  
+  /**
+   * Build SQL query for first refresh (all rows are INSERT)
+   */
+  private buildFirstRefreshQuery(selectWithHash: string): string {
+    return `
+      SELECT 
+        *,
+        'INSERT' AS "${SYSTEM_COLUMN_PREFIX}operation",
+        CURRENT_TIMESTAMP AS "${SYSTEM_COLUMN_PREFIX}timestamp",
+        CURRENT_TIMESTAMP AS "${SYSTEM_COLUMN_PREFIX}last_updated"
+      FROM (${selectWithHash}) t
+    `;
   }
   
   /**

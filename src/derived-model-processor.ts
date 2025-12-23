@@ -169,9 +169,9 @@ export class DerivedModelJobProcessor {
    * Queue a derived model refresh job to PGMQ
    */
   private async queueDerivedModelRefresh(job: DerivedModelJobPayload): Promise<void> {
-    const { error } = await this.supabase.rpc('pgmq_send', {
+    const { error } = await this.supabase.rpc('nova_pgmq_send', {
       queue_name: 'stream_sync_jobs_derived',
-      msg: JSON.stringify(job),
+      message: job,
     });
     
     if (error) {

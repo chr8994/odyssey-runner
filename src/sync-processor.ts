@@ -80,7 +80,7 @@ export class SyncProcessor {
       }
       
       // Step 3: Fetch field mappings
-      const fieldMappings = await this.fetchFieldMappings(job.stream_id);
+      const fieldMappings = await this.fetchFieldMappings(job.stream_id, dataSource.id);
       console.log(`[SyncProcessor] Found ${fieldMappings.length} field mappings`);
       
       // Step 4: Build processor context
@@ -90,7 +90,7 @@ export class SyncProcessor {
         runId: job.run_id,
         stream: stream as unknown as DataStream,
         dataSource: dataSource as DataSource,
-        schema: (stream.schema || []) as StreamSchemaColumn[],
+        schema: stream.schema || [], // Pass stream schema for type information
         fieldMappings,
       };
       
@@ -143,14 +143,46 @@ export class SyncProcessor {
   
   /**
    * Fetch field mappings for a stream
+   * First checks data_mappings table, then falls back to data_schemas.schema sourceColumn mappings
    */
-  private async fetchFieldMappings(streamId: string): Promise<FieldMapping[]> {
+  private async fetchFieldMappings(streamId: string, dataSourceId?: string): Promise<FieldMapping[]> {
+    // First try to get mappings from data_mappings table
     const { data: dataMapping } = await this.supabase
       .from('data_mappings')
       .select('id, field_mappings')
       .eq('data_stream_id', streamId)
       .single();
     
-    return dataMapping?.field_mappings || [];
+    if (dataMapping?.field_mappings && dataMapping.field_mappings.length > 0) {
+      return dataMapping.field_mappings;
+    }
+    
+    // Fallback: Extract mappings from data_schemas.schema sourceColumn properties
+    if (dataSourceId) {
+      const { data: dataSchema } = await this.supabase
+        .from('data_schemas')
+        .select('schema')
+        .eq('data_source_id', dataSourceId)
+        .single();
+      
+      if (dataSchema?.schema?.children) {
+        const schemaBasedMappings: FieldMapping[] = [];
+        for (const field of dataSchema.schema.children) {
+          if (field.sourceColumn && field.name) {
+            schemaBasedMappings.push({
+              source: field.sourceColumn,
+              target: field.name,
+              transform: null,
+            });
+          }
+        }
+        if (schemaBasedMappings.length > 0) {
+          console.log(`[SyncProcessor] Extracted ${schemaBasedMappings.length} mappings from data_schema sourceColumn fields`);
+          return schemaBasedMappings;
+        }
+      }
+    }
+    
+    return [];
   }
 }

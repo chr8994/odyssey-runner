@@ -9,6 +9,7 @@ import { BaseProcessor } from './base-processor.js';
 import { FileProcessor } from './file.js';
 import { SftpProcessor } from './sftp.js';
 import { MySqlProcessor } from './mysql.js';
+import { PostgresProcessor } from './postgres.js';
 import { DataSourceType } from '../types.js';
 
 /**
@@ -18,8 +19,8 @@ export const PROCESSOR_TYPES = {
   file: FileProcessor,
   sftp: SftpProcessor,
   mysql: MySqlProcessor,
+  postgres: PostgresProcessor,
   // Future processors:
-  // postgres: PostgresProcessor,
   // api: ApiProcessor,
 } as const;
 
@@ -68,5 +69,6 @@ export { BaseProcessor } from './base-processor.js';
 export { FileProcessor } from './file.js';
 export { SftpProcessor } from './sftp.js';
 export { MySqlProcessor } from './mysql.js';
+export { PostgresProcessor } from './postgres.js';
 export { DerivedModelProcessor } from './derived-model.js';
 export { OutboundProcessor } from './outbound.js';
