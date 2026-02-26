@@ -347,6 +347,13 @@ export class OutboundProcessor {
   private readonly ROW_HASH_COLUMN = '$_ref';
   
   /**
+   * CDC (Change Data Capture) columns that should be excluded from target database exports
+   * These columns are used internally for tracking but should not be sent to external databases
+   * Note: $_ref is handled separately as it's used for change detection logic
+   */
+  private readonly CDC_COLUMNS = ['$_operation', '$_timestamp', '$_last_updated'];
+  
+  /**
    * Calculate table checksum from all $_ref values
    * This is used to quickly detect if any data changed since last sync
    */
@@ -478,12 +485,18 @@ export class OutboundProcessor {
       }
       console.log(`${logPrefix} Source has ${sourceColumns.length} columns`);
       
-      // Get target table columns (if table exists)
+      // Get target table columns and nullability constraints (if table exists)
       let targetColumns: string[] = [];
+      const targetColumnNullability = new Map<string, boolean>(); // column name -> is nullable
       try {
-        const targetColumnsQuery = `SELECT column_name FROM (DESCRIBE ${fullTableName})`;
+        const targetColumnsQuery = `SELECT column_name, is_nullable FROM (DESCRIBE ${fullTableName})`;
         const targetColumnsResult = await connection.runAndReadAll(targetColumnsQuery);
-        targetColumns = targetColumnsResult.getRows().map((row: any[]) => row[0] as string);
+        for (const row of targetColumnsResult.getRows()) {
+          const colName = row[0] as string;
+          const isNullable = String(row[1]).toUpperCase() === 'YES';
+          targetColumns.push(colName);
+          targetColumnNullability.set(colName.toLowerCase(), isNullable);
+        }
         console.log(`${logPrefix} Target table has ${targetColumns.length} columns`);
       } catch (e) {
         // Table doesn't exist yet, will be created
@@ -491,24 +504,30 @@ export class OutboundProcessor {
       }
       
       // Find columns that exist in both source and target (for exporting to target)
-      // If target table doesn't exist yet, use all source columns except $_ref
+      // If target table doesn't exist yet, use all source columns except $_ref and CDC columns
       let exportColumns: string[];
+      const cdcColumnSet = new Set([this.ROW_HASH_COLUMN, ...this.CDC_COLUMNS]);
+      
       if (targetColumns.length > 0) {
         const targetColumnSet = new Set(targetColumns.map(c => c.toLowerCase()));
-        // Filter source columns by what exists in target, but exclude $_ref from export
+        // Filter source columns by what exists in target, but exclude $_ref and CDC columns from export
         exportColumns = sourceColumns.filter(col => 
-          col !== this.ROW_HASH_COLUMN && targetColumnSet.has(col.toLowerCase())
+          !cdcColumnSet.has(col) && targetColumnSet.has(col.toLowerCase())
         );
         
         const skippedColumns = sourceColumns.filter(col => 
-          col !== this.ROW_HASH_COLUMN && !targetColumnSet.has(col.toLowerCase())
+          !cdcColumnSet.has(col) && !targetColumnSet.has(col.toLowerCase())
         );
         if (skippedColumns.length > 0) {
           console.log(`${logPrefix} Skipping ${skippedColumns.length} column(s) not in target: ${skippedColumns.join(', ')}`);
         }
       } else {
-        // New table - export all columns except $_ref (which is for internal change detection only)
-        exportColumns = sourceColumns.filter(col => col !== this.ROW_HASH_COLUMN);
+        // New table - export all columns except $_ref and CDC columns (which are for internal tracking only)
+        exportColumns = sourceColumns.filter(col => !cdcColumnSet.has(col));
+        const excludedCdcColumns = sourceColumns.filter(col => cdcColumnSet.has(col));
+        if (excludedCdcColumns.length > 0) {
+          console.log(`${logPrefix} Excluding ${excludedCdcColumns.length} CDC column(s) from export: ${excludedCdcColumns.join(', ')}`);
+        }
       }
       
       console.log(`${logPrefix} Exporting ${exportColumns.length} columns to target`);
@@ -523,49 +542,88 @@ export class OutboundProcessor {
         schemaMap.set(colName, colType);
       }
       
-      // Build column expressions with zero date handling for DATE and TIMESTAMP columns
+      // Build column expressions with smart NULL handling based on target column constraints
       const columnExpressions = exportColumns.map(col => {
         const colType = schemaMap.get(col);
+        const isTargetNullable = targetColumnNullability.get(col.toLowerCase()) !== false; // default to true if unknown
         
-        // Convert MySQL zero dates to NULL for date/timestamp columns
+        // Handle date/timestamp columns with smart NULL/sentinel value logic
         if (colType?.includes('DATE') || colType?.includes('TIMESTAMP')) {
-          console.log(`${logPrefix} Converting zero dates to NULL for column: ${col} (${colType})`);
-          // Check multiple conditions:
-          // 1. Direct string match (if stored as varchar)
-          // 2. Year extraction equals 0 (if stored as date)
-          // 3. Date equals special sentinel values
-          return `
-            CASE 
-              WHEN "${col}" IS NULL THEN NULL
-              WHEN TRY_CAST("${col}" AS VARCHAR) = '0000-00-00' THEN NULL
-              WHEN TRY_CAST("${col}" AS VARCHAR) LIKE '0000-00-00%' THEN NULL
-              WHEN YEAR("${col}") = 0 THEN NULL
-              WHEN "${col}" = DATE '0000-01-01' THEN NULL
-              WHEN "${col}" < DATE '1900-01-01' THEN NULL
-              ELSE "${col}"
-            END AS "${col}"
-          `.trim();
+          const sentinelValue = colType.includes('TIMESTAMP') ? "TIMESTAMP '1900-01-01 00:00:00'" : "DATE '1900-01-01'";
+          
+          if (isTargetNullable) {
+            console.log(`${logPrefix} Converting zero dates to NULL for column: ${col} (${colType}, nullable)`);
+            // Target column is nullable - convert zero dates to NULL
+            return `
+              CASE 
+                WHEN "${col}" IS NULL THEN NULL
+                WHEN TRY_CAST("${col}" AS VARCHAR) = '0000-00-00' THEN NULL
+                WHEN TRY_CAST("${col}" AS VARCHAR) LIKE '0000-00-00%' THEN NULL
+                WHEN TRY_CAST("${col}" AS DATE) IS NULL THEN NULL
+                WHEN YEAR(TRY_CAST("${col}" AS DATE)) = 0 THEN NULL
+                WHEN TRY_CAST("${col}" AS DATE) = DATE '0000-01-01' THEN NULL
+                WHEN TRY_CAST("${col}" AS DATE) < DATE '1900-01-01' THEN NULL
+                ELSE CAST("${col}" AS ${colType})
+              END AS "${col}"
+            `.trim();
+          } else {
+            console.log(`${logPrefix} Converting zero dates to sentinel for column: ${col} (${colType}, NOT NULL)`);
+            // Target column is NOT NULL - convert zero dates to sentinel value
+            return `
+              CASE 
+                WHEN "${col}" IS NULL THEN ${sentinelValue}
+                WHEN TRY_CAST("${col}" AS VARCHAR) = '0000-00-00' THEN ${sentinelValue}
+                WHEN TRY_CAST("${col}" AS VARCHAR) LIKE '0000-00-00%' THEN ${sentinelValue}
+                WHEN TRY_CAST("${col}" AS DATE) IS NULL THEN ${sentinelValue}
+                WHEN YEAR(TRY_CAST("${col}" AS DATE)) = 0 THEN ${sentinelValue}
+                WHEN TRY_CAST("${col}" AS DATE) = DATE '0000-01-01' THEN ${sentinelValue}
+                WHEN TRY_CAST("${col}" AS DATE) < DATE '1900-01-01' THEN ${sentinelValue}
+                ELSE CAST("${col}" AS ${colType})
+              END AS "${col}"
+            `.trim();
+          }
         }
         
+        // Handle text/varchar columns that are NOT NULL
+        if (!isTargetNullable && (colType?.includes('VARCHAR') || colType?.includes('TEXT') || colType?.includes('CHAR'))) {
+          console.log(`${logPrefix} Converting NULL to empty string for column: ${col} (${colType}, NOT NULL)`);
+          return `COALESCE("${col}", '') AS "${col}"`;
+        }
+        
+        // Handle numeric columns that are NOT NULL
+        if (!isTargetNullable && (colType?.includes('INT') || colType?.includes('DECIMAL') || colType?.includes('NUMERIC') || colType?.includes('FLOAT') || colType?.includes('DOUBLE'))) {
+          console.log(`${logPrefix} Converting NULL to 0 for column: ${col} (${colType}, NOT NULL)`);
+          return `COALESCE("${col}", 0) AS "${col}"`;
+        }
+        
+        // Default: use column as-is with explicit type casting if we know the type
+        if (colType) {
+          return `CAST("${col}" AS ${colType}) AS "${col}"`;
+        }
         return `"${col}"`;
       });
       
-      // Add $_ref column if it exists (needed for change detection, but not exported to target)
+      // Recalculate $_ref hash from transformed columns (after date conversions)
+      // This ensures the hash is stable across syncs even with date format changes
       if (hasRefColumn) {
-        columnExpressions.push(`"${this.ROW_HASH_COLUMN}"`);
+        const hashColumns = exportColumns.map(col => `COALESCE(CAST("${col}" AS VARCHAR), '')`).join(', ');
+        const recalculatedRefExpr = `md5(CONCAT_WS('|', ${hashColumns})) AS "${this.ROW_HASH_COLUMN}"`;
+        columnExpressions.push(recalculatedRefExpr);
+        console.log(`${logPrefix} Recalculating ${this.ROW_HASH_COLUMN} from transformed columns for stable change detection`);
       }
       
       const columnList = columnExpressions.join(', ');
-      const sourceQuery = `SELECT ${columnList} FROM read_parquet('${escapedParquet}')`;
+      let sourceQuery = `SELECT ${columnList} FROM read_parquet('${escapedParquet}')`;
       
-      console.log(`${logPrefix} Applied zero date conversion to ${exportColumns.filter(col => {
+      const dateColumns = exportColumns.filter(col => {
         const colType = schemaMap.get(col);
         return colType?.includes('DATE') || colType?.includes('TIMESTAMP');
-      }).length} date/timestamp column(s)`);
-      
-      if (hasRefColumn) {
-        console.log(`${logPrefix} Including ${this.ROW_HASH_COLUMN} column for change detection`);
-      }
+      });
+      const notNullColumns = exportColumns.filter(col => {
+        return targetColumnNullability.get(col.toLowerCase()) === false;
+      });
+      console.log(`${logPrefix} Applied smart NULL handling to ${dateColumns.length} date/timestamp column(s)`);
+      console.log(`${logPrefix} Target has ${notNullColumns.length} NOT NULL column(s): ${notNullColumns.slice(0, 5).join(', ')}${notNullColumns.length > 5 ? '...' : ''}`);
       
       // DEBUG: Sample the source query to see what we're sending to MySQL
       try {
@@ -599,6 +657,110 @@ export class OutboundProcessor {
           CREATE TABLE IF NOT EXISTS ${fullTableName}
           AS ${sourceQuery} LIMIT 0
         `);
+        
+        // Re-query table schema after creation to get actual nullability constraints
+        if (targetColumns.length === 0) {
+          console.log(`${logPrefix} Re-querying table schema after creation to get constraints...`);
+          try {
+            // Query MySQL information_schema directly to get column metadata
+            // DESCRIBE on MySQL-attached tables doesn't return is_nullable
+            const infoSchemaQuery = `
+              SELECT COLUMN_NAME, IS_NULLABLE 
+              FROM ${alias}.information_schema.COLUMNS 
+              WHERE TABLE_SCHEMA = '${schemaName}' 
+                AND TABLE_NAME = '${tableName}'
+            `;
+            const targetColumnsResult = await connection.runAndReadAll(infoSchemaQuery);
+            targetColumns = []; // Clear and rebuild
+            targetColumnNullability.clear();
+            for (const row of targetColumnsResult.getRows()) {
+              const colName = row[0] as string;
+              const isNullable = String(row[1]).toUpperCase() === 'YES';
+              targetColumns.push(colName);
+              targetColumnNullability.set(colName.toLowerCase(), isNullable);
+            }
+            const notNullCount = Array.from(targetColumnNullability.values()).filter(v => !v).length;
+            console.log(`${logPrefix} Re-queried schema from information_schema: ${targetColumns.length} columns, ${notNullCount} NOT NULL`);
+            
+            // IMPORTANT: Rebuild column expressions with actual NOT NULL constraints
+            console.log(`${logPrefix} Rebuilding column expressions with actual constraints...`);
+            const rebuiltColumnExpressions = exportColumns.map(col => {
+              const colType = schemaMap.get(col);
+              const isTargetNullable = targetColumnNullability.get(col.toLowerCase()) !== false;
+              
+              // Handle date/timestamp columns with smart NULL/sentinel value logic
+              if (colType?.includes('DATE') || colType?.includes('TIMESTAMP')) {
+                const sentinelValue = colType.includes('TIMESTAMP') ? "TIMESTAMP '1900-01-01 00:00:00'" : "DATE '1900-01-01'";
+                
+                if (isTargetNullable) {
+                  // Target column is nullable - convert zero dates to NULL
+                  return `
+                    CASE 
+                      WHEN "${col}" IS NULL THEN NULL
+                      WHEN TRY_CAST("${col}" AS VARCHAR) = '0000-00-00' THEN NULL
+                      WHEN TRY_CAST("${col}" AS VARCHAR) LIKE '0000-00-00%' THEN NULL
+                      WHEN TRY_CAST("${col}" AS DATE) IS NULL THEN NULL
+                      WHEN YEAR(TRY_CAST("${col}" AS DATE)) = 0 THEN NULL
+                      WHEN TRY_CAST("${col}" AS DATE) = DATE '0000-01-01' THEN NULL
+                      WHEN TRY_CAST("${col}" AS DATE) < DATE '1900-01-01' THEN NULL
+                      ELSE CAST("${col}" AS ${colType})
+                    END AS "${col}"
+                  `.trim();
+                } else {
+                  console.log(`${logPrefix} Converting zero dates to sentinel for column: ${col} (${colType}, NOT NULL)`);
+                  // Target column is NOT NULL - convert zero dates to sentinel value
+                  return `
+                    CASE 
+                      WHEN "${col}" IS NULL THEN ${sentinelValue}
+                      WHEN TRY_CAST("${col}" AS VARCHAR) = '0000-00-00' THEN ${sentinelValue}
+                      WHEN TRY_CAST("${col}" AS VARCHAR) LIKE '0000-00-00%' THEN ${sentinelValue}
+                      WHEN TRY_CAST("${col}" AS DATE) IS NULL THEN ${sentinelValue}
+                      WHEN YEAR(TRY_CAST("${col}" AS DATE)) = 0 THEN ${sentinelValue}
+                      WHEN TRY_CAST("${col}" AS DATE) = DATE '0000-01-01' THEN ${sentinelValue}
+                      WHEN TRY_CAST("${col}" AS DATE) < DATE '1900-01-01' THEN ${sentinelValue}
+                      ELSE CAST("${col}" AS ${colType})
+                    END AS "${col}"
+                  `.trim();
+                }
+              }
+              
+              // Handle text/varchar columns that are NOT NULL
+              if (!isTargetNullable && (colType?.includes('VARCHAR') || colType?.includes('TEXT') || colType?.includes('CHAR'))) {
+                console.log(`${logPrefix} Converting NULL to empty string for column: ${col} (${colType}, NOT NULL)`);
+                return `COALESCE("${col}", '') AS "${col}"`;
+              }
+              
+              // Handle numeric columns that are NOT NULL
+              if (!isTargetNullable && (colType?.includes('INT') || colType?.includes('DECIMAL') || colType?.includes('NUMERIC') || colType?.includes('FLOAT') || colType?.includes('DOUBLE'))) {
+                console.log(`${logPrefix} Converting NULL to 0 for column: ${col} (${colType}, NOT NULL)`);
+                return `COALESCE("${col}", 0) AS "${col}"`;
+              }
+              
+              // Default: use column as-is with explicit type casting if we know the type
+              if (colType) {
+                return `CAST("${col}" AS ${colType}) AS "${col}"`;
+              }
+              return `"${col}"`;
+            });
+            
+            // Recalculate $_ref hash from transformed columns
+            if (hasRefColumn) {
+              const hashColumns = exportColumns.map(col => `COALESCE(CAST("${col}" AS VARCHAR), '')`).join(', ');
+              const recalculatedRefExpr = `md5(CONCAT_WS('|', ${hashColumns})) AS "${this.ROW_HASH_COLUMN}"`;
+              rebuiltColumnExpressions.push(recalculatedRefExpr);
+            }
+            
+            const rebuiltColumnList = rebuiltColumnExpressions.join(', ');
+            sourceQuery = `SELECT ${rebuiltColumnList} FROM read_parquet('${escapedParquet}')`;
+            
+            const notNullColumnsRebuilt = exportColumns.filter(col => {
+              return targetColumnNullability.get(col.toLowerCase()) === false;
+            });
+            console.log(`${logPrefix} Rebuilt query with ${notNullColumnsRebuilt.length} NOT NULL columns handled`);
+          } catch (e) {
+            console.warn(`${logPrefix} Could not re-query table schema after creation:`, e);
+          }
+        }
         
         // If we have upsert keys, add PRIMARY KEY constraint
         if (effectiveUpsertKeys.length > 0) {
@@ -663,8 +825,9 @@ export class OutboundProcessor {
           // Use ROW_NUMBER() to keep only one row per key combination
           const partitionKeys = effectiveUpsertKeys.map(k => `"${k}"`).join(', ');
           
-          // Include $_ref column if it exists (needed for change detection)
-          const selectColumns = hasRefColumn 
+          // Only include $_ref for change detection when doing incremental upserts
+          // In truncate mode, we don't need change detection (and it causes column count mismatch)
+          const selectColumns = (hasRefColumn && targetConfig.truncateFirst !== true)
             ? `${simpleColumnList}, "${this.ROW_HASH_COLUMN}"`
             : simpleColumnList;
           
@@ -679,8 +842,8 @@ export class OutboundProcessor {
             WHERE _rn = 1
           `;
           
-          // Check if truncateFirst is explicitly disabled
-          if (targetConfig.truncateFirst !== false) {
+          // Check if truncateFirst is explicitly enabled
+          if (targetConfig.truncateFirst === true) {
             // Truncate mode: clear the table and reload all data
             console.log(`${logPrefix} Using Truncate + Insert pattern for MySQL`);
             console.log(`${logPrefix} Truncating target table...`);
@@ -690,7 +853,7 @@ export class OutboundProcessor {
             console.log(`${logPrefix} Inserting ${effectiveUpsertKeys.length ? 'deduplicated' : ''} rows...`);
             await connection.run(`INSERT INTO ${fullTableName} (${simpleColumnList}) ${deduplicatedQuery}`);
           } else {
-            // Upsert mode: Use change detection with parquet snapshots
+            // Upsert mode: Use change detection with parquet snapshots (DEFAULT)
             console.log(`${logPrefix} Using change detection approach for MySQL upsert`);
             
             // Try to download previous snapshot
@@ -802,19 +965,17 @@ export class OutboundProcessor {
               console.log(`${logPrefix} Found ${updateCount} rows to UPDATE`);
               
               if (updateCount > 0) {
-                // For MySQL, we can use INSERT ... ON DUPLICATE KEY UPDATE with actual MySQL
-                // But since we can't, we'll use individual UPDATEs
-                // For better performance, create a temp staging table
-                console.log(`${logPrefix} Creating staging table for updates...`);
+                // Create a temporary staging table for updates
+                console.log(`${logPrefix} Creating staging table for ${updateCount} updates...`);
                 await connection.run(`CREATE TEMP TABLE updates_staging AS ${updatedRowsQuery}`);
                 
-                // Use UPDATE FROM pattern (if supported) or individual updates
+                // Use UPDATE FROM pattern
                 const nonPkColumns = exportColumns.filter(col => !effectiveUpsertKeys.includes(col));
                 const updateSetClause = nonPkColumns.map(col => `"${col}" = updates_staging."${col}"`).join(', ');
                 const whereClause = effectiveUpsertKeys.map(k => `${fullTableName}."${k}" = updates_staging."${k}"`).join(' AND ');
                 
                 try {
-                  // Try UPDATE FROM syntax (works in some DBs)
+                  // Try UPDATE FROM syntax (may not be supported by MySQL)
                   await connection.run(`
                     UPDATE ${fullTableName}
                     SET ${updateSetClause}
@@ -823,48 +984,177 @@ export class OutboundProcessor {
                   `);
                   console.log(`${logPrefix} Updated ${updateCount} rows via UPDATE FROM`);
                 } catch (e) {
-                  // Fallback: Use row-by-row updates
-                  console.log(`${logPrefix} UPDATE FROM not supported, using batched updates...`);
+                  // UPDATE FROM not supported - use individual UPDATE statements
+                  // The MySQL connector doesn't support complex CASE-based bulk updates
+                  console.log(`${logPrefix} UPDATE FROM not supported, using individual UPDATE statements...`);
                   const updatedRows = await connection.runAndReadAll(`SELECT * FROM updates_staging`);
                   const rows = updatedRows.getRows();
                   
-                  let updatesBatched = 0;
-                  for (const row of rows) {
-                    const setValues = nonPkColumns.map((col, idx) => {
-                      const colIdx = exportColumns.indexOf(col);
-                      const value = row[colIdx];
-                      return `"${col}" = ${value === null ? 'NULL' : `'${String(value).replace(/'/g, "''")}'`}`;
-                    }).join(', ');
+                  // Execute individual UPDATE statements for each row
+                  // Less efficient but works within MySQL connector limitations
+                  const pkIndexes = effectiveUpsertKeys.map(k => exportColumns.indexOf(k));
+                  const nonPkIndexes = nonPkColumns.map(col => exportColumns.indexOf(col));
+                  
+                  let successfulUpdates = 0;
+                  for (let i = 0; i < rows.length; i++) {
+                    const row = rows[i];
                     
-                    const whereValues = effectiveUpsertKeys.map(k => {
-                      const colIdx = exportColumns.indexOf(k);
-                      const value = row[colIdx];
-                      return `"${k}" = '${String(value).replace(/'/g, "''")}'`;
+                    // Build WHERE clause from primary key values
+                    const whereConditions = effectiveUpsertKeys.map((k, pkIdx) => {
+                      const val = row[pkIndexes[pkIdx]];
+                      const valStr = val === null ? 'NULL' : `'${String(val).replace(/'/g, "''")}'`;
+                      return `"${k}" = ${valStr}`;
                     }).join(' AND ');
                     
-                    await connection.run(`UPDATE ${fullTableName} SET ${setValues} WHERE ${whereValues}`);
-                    updatesBatched++;
+                    // Build SET clause from non-PK columns
+                    const setStatements = nonPkColumns.map((col, idx) => {
+                      const val = row[nonPkIndexes[idx]];
+                      const valStr = val === null ? 'NULL' : `'${String(val).replace(/'/g, "''")}'`;
+                      return `"${col}" = ${valStr}`;
+                    }).join(', ');
                     
-                    if (updatesBatched % 100 === 0) {
-                      console.log(`${logPrefix} Updated ${updatesBatched}/${updateCount} rows...`);
+                    const updateQuery = `
+                      UPDATE ${fullTableName}
+                      SET ${setStatements}
+                      WHERE ${whereConditions}
+                    `;
+                    
+                    try {
+                      await connection.run(updateQuery);
+                      successfulUpdates++;
+                      
+                      // Log progress every 50 rows
+                      if ((i + 1) % 50 === 0 || (i + 1) === rows.length) {
+                        console.log(`${logPrefix} Updated ${i + 1}/${rows.length} rows...`);
+                      }
+                    } catch (updateError) {
+                      console.error(`${logPrefix} Failed to update row ${i + 1}:`, updateError);
+                      // Continue with other updates
                     }
                   }
-                  console.log(`${logPrefix} Updated all ${updateCount} rows`);
+                  
+                  console.log(`${logPrefix} Updated ${successfulUpdates}/${rows.length} rows via individual UPDATE statements`);
                 }
                 
-                await connection.run(`DROP TABLE updates_staging`);
+                // Clean up staging table
+                try {
+                  await connection.run(`DROP TABLE updates_staging`);
+                } catch (e) {
+                  console.warn(`${logPrefix} Failed to drop staging table:`, e);
+                }
               }
               
               console.log(`${logPrefix} Change detection complete: ${newCount} inserted, ${updateCount} updated`);
               
+              // Gap fill: Check for rows in source that are missing from the MySQL target
+              // This catches rows that were missed by previous bootstrap bugs or failed inserts
+              if (effectiveUpsertKeys.length > 0) {
+                try {
+                  console.log(`${logPrefix} Gap fill: Checking for rows missing from target table...`);
+                  
+                  const gapFillJoinConditions = effectiveUpsertKeys.map(k => 
+                    `source_data."${k}" = existing."${k}"`
+                  ).join(' AND ');
+                  
+                  const simpleColumnListFromSource = exportColumns.map(col => `source_data."${col}"`).join(', ');
+                  
+                  const missingRowsQuery = `
+                    SELECT ${simpleColumnListFromSource}
+                    FROM (${deduplicatedQuery}) source_data
+                    LEFT JOIN ${fullTableName} existing
+                      ON ${gapFillJoinConditions}
+                    WHERE existing."${effectiveUpsertKeys[0]}" IS NULL
+                  `;
+                  
+                  const missingCountResult = await connection.runAndReadAll(
+                    `SELECT COUNT(*) FROM (${missingRowsQuery})`
+                  );
+                  const missingCount = Number(missingCountResult.getRows()[0]?.[0] || 0);
+                  
+                  if (missingCount > 0) {
+                    console.log(`${logPrefix} Gap fill: Found ${missingCount} rows in source missing from target - inserting...`);
+                    try {
+                      await connection.run(`
+                        INSERT INTO ${fullTableName} (${simpleColumnList})
+                        ${missingRowsQuery}
+                      `);
+                      console.log(`${logPrefix} Gap fill: Inserted ${missingCount} missing rows into target`);
+                    } catch (insertError: any) {
+                      if (insertError.message && insertError.message.includes('Duplicate entry')) {
+                        console.log(`${logPrefix} Gap fill: Some rows already existed (race condition) - skipping duplicates`);
+                      } else {
+                        throw insertError;
+                      }
+                    }
+                  } else {
+                    console.log(`${logPrefix} Gap fill: All source rows exist in target - no gaps found`);
+                  }
+                } catch (gapFillError: any) {
+                  console.error(`${logPrefix} Gap fill check failed (non-fatal):`, gapFillError.message);
+                }
+              }
+              
               // Cleanup previous snapshot temp file
               this.cleanupTempFile(tempPreviousPath);
             } else {
-              // No previous snapshot - bootstrap by saving current state without INSERT
-              // This preserves any existing data in the table
-              console.log(`${logPrefix} No snapshot found - bootstrapping snapshot from current data`);
-              console.log(`${logPrefix} Skipping INSERT (preserving any existing data in table)`);
-              console.log(`${logPrefix} Next sync will perform incremental updates based on this baseline`);
+              // No previous snapshot - bootstrap mode
+              // Insert only rows that don't already exist in the target (safe for existing data)
+              console.log(`${logPrefix} No snapshot found - bootstrapping with safe "insert missing rows" approach`);
+              
+              if (effectiveUpsertKeys.length > 0) {
+                // Use primary keys to detect which rows are missing from the target
+                console.log(`${logPrefix} Checking target table for existing rows using keys: ${effectiveUpsertKeys.join(', ')}`);
+                
+                try {
+                  // Query: SELECT from source LEFT JOIN target ON PKs WHERE target PK IS NULL
+                  const pkJoinConditions = effectiveUpsertKeys.map(k => 
+                    `source_data."${k}" = existing."${k}"`
+                  ).join(' AND ');
+                  
+                  const simpleColumnListFromSource = exportColumns.map(col => `source_data."${col}"`).join(', ');
+                  
+                  const missingRowsQuery = `
+                    SELECT ${simpleColumnListFromSource}
+                    FROM (${deduplicatedQuery}) source_data
+                    LEFT JOIN ${fullTableName} existing
+                      ON ${pkJoinConditions}
+                    WHERE existing."${effectiveUpsertKeys[0]}" IS NULL
+                  `;
+                  
+                  // Count missing rows first
+                  const missingCountResult = await connection.runAndReadAll(
+                    `SELECT COUNT(*) FROM (${missingRowsQuery})`
+                  );
+                  const missingCount = Number(missingCountResult.getRows()[0]?.[0] || 0);
+                  
+                  console.log(`${logPrefix} Bootstrap: Found ${missingCount} rows missing from target (out of source data)`);
+                  
+                  if (missingCount > 0) {
+                    try {
+                      await connection.run(`
+                        INSERT INTO ${fullTableName} (${simpleColumnList})
+                        ${missingRowsQuery}
+                      `);
+                      console.log(`${logPrefix} Bootstrap: Inserted ${missingCount} missing rows into target`);
+                    } catch (insertError: any) {
+                      if (insertError.message && insertError.message.includes('Duplicate entry')) {
+                        console.log(`${logPrefix} Bootstrap: Some rows already existed (race condition) - skipping duplicates`);
+                      } else {
+                        throw insertError;
+                      }
+                    }
+                  } else {
+                    console.log(`${logPrefix} Bootstrap: All source rows already exist in target - nothing to insert`);
+                  }
+                } catch (bootstrapError: any) {
+                  console.error(`${logPrefix} Bootstrap insert failed:`, bootstrapError.message);
+                  console.log(`${logPrefix} Falling back to saving snapshot only (data will sync on next run with changes)`);
+                }
+              } else {
+                // No primary keys defined - can't safely determine what's missing
+                console.log(`${logPrefix} No primary keys defined - skipping bootstrap INSERT to avoid duplicates`);
+                console.log(`${logPrefix} Configure primaryKey or upsertKeys in target_config to enable safe bootstrap`);
+              }
             }
             
             // Save current parquet as the new snapshot for next sync
