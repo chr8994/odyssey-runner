@@ -111,7 +111,8 @@ export class OutboundProcessor {
             context.targetDataSource,
             context.stream.target_config as DatabaseTargetConfig,
             context.tenantId,
-            context.streamId
+            context.streamId,
+            context.jobId
           );
           console.log(`${logPrefix} Inserted to ${context.targetDataSource.type}: ${targetTable}`);
           break;
@@ -408,7 +409,8 @@ export class OutboundProcessor {
     dataSource: DataSource,
     targetConfig: DatabaseTargetConfig,
     tenantId: string,
-    streamId: string
+    streamId: string,
+    jobId?: string
   ): Promise<string> {
     const logPrefix = `[OutboundProcessor:${dataSource.type.toUpperCase()}]`;
     const connection = await instance.connect();
@@ -786,6 +788,28 @@ export class OutboundProcessor {
         await connection.run(`DELETE FROM ${fullTableName}`);
       }
       
+      // === CHANGELOG: Create staging table for tracking all changes ===
+      const simpleColumnListShared = exportColumns.map(col => `"${col}"`).join(', ');
+      let changelogHasEntries = false;
+      const syncTimestamp = new Date().toISOString();
+      const escapedJobId = (jobId || 'unknown').replace(/'/g, "''");
+      
+      try {
+        await connection.run(`
+          CREATE TEMP TABLE changelog_staging AS
+          SELECT ${simpleColumnListShared},
+                 CAST('' AS VARCHAR) AS "$_changelog_operation",
+                 CAST('' AS VARCHAR) AS "$_changelog_timestamp",
+                 CAST('' AS VARCHAR) AS "$_changelog_job_id",
+                 CAST('' AS VARCHAR) AS "$_changelog_row_type"
+          FROM (${sourceQuery}) _src
+          LIMIT 0
+        `);
+        console.log(`${logPrefix} Changelog staging table created`);
+      } catch (changelogErr) {
+        console.warn(`${logPrefix} Failed to create changelog staging table (changelog will be skipped):`, changelogErr);
+      }
+      
       // Insert or upsert data
       if (useUpsert && effectiveUpsertKeys.length > 0) {
         console.log(`${logPrefix} Upserting data with keys: ${effectiveUpsertKeys.join(', ')}`);
@@ -807,6 +831,23 @@ export class OutboundProcessor {
               ${sourceQuery}
               ON CONFLICT (${conflictKeys}) DO UPDATE SET ${updateSet}
             `);
+            
+            // CHANGELOG: Record Postgres upsert rows
+            try {
+              await connection.run(`
+                INSERT INTO changelog_staging
+                SELECT ${simpleColumnListShared},
+                       'UPSERT' AS "$_changelog_operation",
+                       '${syncTimestamp}' AS "$_changelog_timestamp",
+                       '${escapedJobId}' AS "$_changelog_job_id",
+                       'new' AS "$_changelog_row_type"
+                FROM (${sourceQuery}) _pg
+              `);
+              changelogHasEntries = true;
+              console.log(`${logPrefix} Changelog: Recorded UPSERT entries (Postgres)`);
+            } catch (clErr) {
+              console.warn(`${logPrefix} Changelog: Failed to record Postgres UPSERT entries:`, clErr);
+            }
           } else {
             // No columns to update, just skip duplicates
             await connection.run(`
@@ -814,6 +855,23 @@ export class OutboundProcessor {
               ${sourceQuery}
               ON CONFLICT (${conflictKeys}) DO NOTHING
             `);
+            
+            // CHANGELOG: Record Postgres insert rows
+            try {
+              await connection.run(`
+                INSERT INTO changelog_staging
+                SELECT ${simpleColumnListShared},
+                       'UPSERT' AS "$_changelog_operation",
+                       '${syncTimestamp}' AS "$_changelog_timestamp",
+                       '${escapedJobId}' AS "$_changelog_job_id",
+                       'new' AS "$_changelog_row_type"
+                FROM (${sourceQuery}) _pg
+              `);
+              changelogHasEntries = true;
+              console.log(`${logPrefix} Changelog: Recorded UPSERT entries (Postgres DO NOTHING)`);
+            } catch (clErr) {
+              console.warn(`${logPrefix} Changelog: Failed to record Postgres UPSERT entries:`, clErr);
+            }
           }
         } else {
           // MySQL: Use INSERT ... ON DUPLICATE KEY UPDATE for proper upsert
@@ -852,6 +910,23 @@ export class OutboundProcessor {
             // Simple INSERT (no duplicates after truncate)
             console.log(`${logPrefix} Inserting ${effectiveUpsertKeys.length ? 'deduplicated' : ''} rows...`);
             await connection.run(`INSERT INTO ${fullTableName} (${simpleColumnList}) ${deduplicatedQuery}`);
+            
+            // CHANGELOG: Record truncate+reload rows
+            try {
+              await connection.run(`
+                INSERT INTO changelog_staging
+                SELECT ${simpleColumnList},
+                       'TRUNCATE_RELOAD' AS "$_changelog_operation",
+                       '${syncTimestamp}' AS "$_changelog_timestamp",
+                       '${escapedJobId}' AS "$_changelog_job_id",
+                       'new' AS "$_changelog_row_type"
+                FROM (${deduplicatedQuery}) _tr
+              `);
+              changelogHasEntries = true;
+              console.log(`${logPrefix} Changelog: Recorded TRUNCATE_RELOAD entries`);
+            } catch (clErr) {
+              console.warn(`${logPrefix} Changelog: Failed to record TRUNCATE_RELOAD entries:`, clErr);
+            }
           } else {
             // Upsert mode: Use change detection with parquet snapshots (DEFAULT)
             console.log(`${logPrefix} Using change detection approach for MySQL upsert`);
@@ -929,6 +1004,23 @@ export class OutboundProcessor {
                     // Not a duplicate error, re-throw
                     throw insertError;
                   }
+                }
+                
+                // CHANGELOG: Record new rows as INSERT
+                try {
+                  await connection.run(`
+                    INSERT INTO changelog_staging
+                    SELECT ${simpleColumnListQualified},
+                           'INSERT' AS "$_changelog_operation",
+                           '${syncTimestamp}' AS "$_changelog_timestamp",
+                           '${escapedJobId}' AS "$_changelog_job_id",
+                           'new' AS "$_changelog_row_type"
+                    FROM (${newRowsQuery}) _new
+                  `);
+                  changelogHasEntries = true;
+                  console.log(`${logPrefix} Changelog: Recorded ${newCount} INSERT entries`);
+                } catch (clErr) {
+                  console.warn(`${logPrefix} Changelog: Failed to record INSERT entries:`, clErr);
                 }
               }
               
@@ -1044,6 +1136,62 @@ export class OutboundProcessor {
                 }
               }
               
+              // CHANGELOG: Record updated rows (both old and new values)
+              if (updateCount > 0) {
+                try {
+                  // Record NEW values for updated rows
+                  await connection.run(`
+                    INSERT INTO changelog_staging
+                    SELECT ${simpleColumnListQualified},
+                           'UPDATE' AS "$_changelog_operation",
+                           '${syncTimestamp}' AS "$_changelog_timestamp",
+                           '${escapedJobId}' AS "$_changelog_job_id",
+                           'new' AS "$_changelog_row_type"
+                    FROM (${updatedRowsQuery}) _upd_new
+                  `);
+                  
+                  // Record PREVIOUS (old) values for updated rows
+                  const previousColumnListQualified = exportColumns.map(col => `previous."${col}"`).join(', ');
+                  let oldRowsQuery: string;
+                  if (hasRefColumn) {
+                    oldRowsQuery = `
+                      SELECT ${previousColumnListQualified}
+                      FROM (${deduplicatedQuery}) current
+                      INNER JOIN read_parquet('${escapedPrevious}') previous
+                        ON ${pkJoinConditions}
+                      WHERE current."${this.ROW_HASH_COLUMN}" != previous."${this.ROW_HASH_COLUMN}"
+                    `;
+                  } else {
+                    const nonPkCols = exportColumns.filter(col => !effectiveUpsertKeys.includes(col));
+                    const valComps = nonPkCols.map(col =>
+                      `(current."${col}" IS DISTINCT FROM previous."${col}")`
+                    ).join(' OR ');
+                    oldRowsQuery = `
+                      SELECT ${previousColumnListQualified}
+                      FROM (${deduplicatedQuery}) current
+                      INNER JOIN read_parquet('${escapedPrevious}') previous
+                        ON ${pkJoinConditions}
+                      WHERE ${valComps}
+                    `;
+                  }
+                  
+                  await connection.run(`
+                    INSERT INTO changelog_staging
+                    SELECT ${exportColumns.map(col => `"${col}"`).join(', ')},
+                           'UPDATE' AS "$_changelog_operation",
+                           '${syncTimestamp}' AS "$_changelog_timestamp",
+                           '${escapedJobId}' AS "$_changelog_job_id",
+                           'previous' AS "$_changelog_row_type"
+                    FROM (${oldRowsQuery}) _upd_old
+                  `);
+                  
+                  changelogHasEntries = true;
+                  console.log(`${logPrefix} Changelog: Recorded ${updateCount} UPDATE entries (old + new)`);
+                } catch (clErr) {
+                  console.warn(`${logPrefix} Changelog: Failed to record UPDATE entries:`, clErr);
+                }
+              }
+              
               console.log(`${logPrefix} Change detection complete: ${newCount} inserted, ${updateCount} updated`);
               
               // Gap fill: Check for rows in source that are missing from the MySQL target
@@ -1079,6 +1227,23 @@ export class OutboundProcessor {
                         ${missingRowsQuery}
                       `);
                       console.log(`${logPrefix} Gap fill: Inserted ${missingCount} missing rows into target`);
+                      
+                      // CHANGELOG: Record gap fill rows
+                      try {
+                        await connection.run(`
+                          INSERT INTO changelog_staging
+                          SELECT ${simpleColumnListFromSource},
+                                 'GAP_FILL' AS "$_changelog_operation",
+                                 '${syncTimestamp}' AS "$_changelog_timestamp",
+                                 '${escapedJobId}' AS "$_changelog_job_id",
+                                 'new' AS "$_changelog_row_type"
+                          FROM (${missingRowsQuery}) _gf
+                        `);
+                        changelogHasEntries = true;
+                        console.log(`${logPrefix} Changelog: Recorded ${missingCount} GAP_FILL entries`);
+                      } catch (clErr) {
+                        console.warn(`${logPrefix} Changelog: Failed to record GAP_FILL entries:`, clErr);
+                      }
                     } catch (insertError: any) {
                       if (insertError.message && insertError.message.includes('Duplicate entry')) {
                         console.log(`${logPrefix} Gap fill: Some rows already existed (race condition) - skipping duplicates`);
@@ -1136,6 +1301,23 @@ export class OutboundProcessor {
                         ${missingRowsQuery}
                       `);
                       console.log(`${logPrefix} Bootstrap: Inserted ${missingCount} missing rows into target`);
+                      
+                      // CHANGELOG: Record bootstrap rows
+                      try {
+                        await connection.run(`
+                          INSERT INTO changelog_staging
+                          SELECT ${simpleColumnListFromSource},
+                                 'BOOTSTRAP' AS "$_changelog_operation",
+                                 '${syncTimestamp}' AS "$_changelog_timestamp",
+                                 '${escapedJobId}' AS "$_changelog_job_id",
+                                 'new' AS "$_changelog_row_type"
+                          FROM (${missingRowsQuery}) _bs
+                        `);
+                        changelogHasEntries = true;
+                        console.log(`${logPrefix} Changelog: Recorded ${missingCount} BOOTSTRAP entries`);
+                      } catch (clErr) {
+                        console.warn(`${logPrefix} Changelog: Failed to record BOOTSTRAP entries:`, clErr);
+                      }
                     } catch (insertError: any) {
                       if (insertError.message && insertError.message.includes('Duplicate entry')) {
                         console.log(`${logPrefix} Bootstrap: Some rows already existed (race condition) - skipping duplicates`);
@@ -1210,9 +1392,34 @@ export class OutboundProcessor {
           offset += batchSize;
           console.log(`${logPrefix} Inserted ${Math.min(offset, totalRows)}/${totalRows} rows`);
         }
+        
+        // CHANGELOG: Record simple insert rows
+        try {
+          await connection.run(`
+            INSERT INTO changelog_staging
+            SELECT ${simpleColumnListShared},
+                   'INSERT' AS "$_changelog_operation",
+                   '${syncTimestamp}' AS "$_changelog_timestamp",
+                   '${escapedJobId}' AS "$_changelog_job_id",
+                   'new' AS "$_changelog_row_type"
+            FROM (${sourceQuery}) _si
+          `);
+          changelogHasEntries = true;
+          console.log(`${logPrefix} Changelog: Recorded ${totalRows} simple INSERT entries`);
+        } catch (clErr) {
+          console.warn(`${logPrefix} Changelog: Failed to record simple INSERT entries:`, clErr);
+        }
       }
       
       console.log(`${logPrefix} Insert complete`);
+      
+      // === CHANGELOG: Merge with existing changelog and upload ===
+      if (changelogHasEntries) {
+        await this.mergeAndUploadChangelog(connection, tenantId, streamId, logPrefix);
+      } else {
+        console.log(`${logPrefix} Changelog: No changes detected - skipping changelog update`);
+      }
+      
       return `${schemaName}.${tableName}`;
       
     } catch (error) {
@@ -1370,6 +1577,98 @@ export class OutboundProcessor {
       } catch (e) {
         console.warn(`[OutboundProcessor] Failed to cleanup temp file:`, e);
       }
+    }
+  }
+  
+  /**
+   * Merge changelog staging with existing changelog parquet and upload to Supabase storage.
+   * Downloads existing changelog (if any), UNIONs with new entries, exports to parquet, uploads.
+   */
+  private async mergeAndUploadChangelog(
+    connection: any,
+    tenantId: string,
+    streamId: string,
+    logPrefix: string
+  ): Promise<void> {
+    const changelogStoragePath = `${tenantId}/${streamId}_changelog.parquet`;
+    let tempExistingPath: string | null = null;
+    let tempOutputPath: string | null = null;
+    
+    try {
+      // Step 1: Try to download existing changelog
+      let hasExisting = false;
+      try {
+        console.log(`${logPrefix} Changelog: Checking for existing changelog at streams/${changelogStoragePath}`);
+        const { data: existingData } = await this.supabase
+          .storage
+          .from('streams')
+          .download(changelogStoragePath);
+        
+        if (existingData) {
+          tempExistingPath = this.getTempFilePath('changelog_existing', `${streamId}.parquet`);
+          const existingBuffer = Buffer.from(await existingData.arrayBuffer());
+          fs.writeFileSync(tempExistingPath, existingBuffer);
+          hasExisting = true;
+          
+          const existingCount = await connection.runAndReadAll(
+            `SELECT COUNT(*) FROM read_parquet('${tempExistingPath.replace(/'/g, "''")}')`
+          );
+          console.log(`${logPrefix} Changelog: Existing changelog has ${existingCount.getRows()[0]?.[0]} entries`);
+        }
+      } catch (e) {
+        console.log(`${logPrefix} Changelog: No existing changelog found - creating new one`);
+      }
+      
+      // Step 2: Count new entries
+      const newCountResult = await connection.runAndReadAll(`SELECT COUNT(*) FROM changelog_staging`);
+      const newEntries = Number(newCountResult.getRows()[0]?.[0] || 0);
+      console.log(`${logPrefix} Changelog: ${newEntries} new entries to append`);
+      
+      // Step 3: Export merged changelog to parquet
+      tempOutputPath = this.getTempFilePath('changelog_merged', `${streamId}.parquet`);
+      const escapedOutput = tempOutputPath.replace(/'/g, "''");
+      
+      if (hasExisting && tempExistingPath) {
+        const escapedExisting = tempExistingPath.replace(/'/g, "''");
+        // UNION existing + new entries
+        await connection.run(`
+          COPY (
+            SELECT * FROM read_parquet('${escapedExisting}')
+            UNION ALL
+            SELECT * FROM changelog_staging
+          ) TO '${escapedOutput}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        `);
+      } else {
+        // Just export the staging table
+        await connection.run(`
+          COPY (SELECT * FROM changelog_staging) 
+          TO '${escapedOutput}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        `);
+      }
+      
+      // Step 4: Upload merged changelog
+      const changelogBuffer = fs.readFileSync(tempOutputPath);
+      const { error: uploadError } = await this.supabase
+        .storage
+        .from('streams')
+        .upload(changelogStoragePath, changelogBuffer, {
+          contentType: 'application/x-parquet',
+          upsert: true,
+        });
+      
+      if (uploadError) {
+        console.warn(`${logPrefix} Changelog: Failed to upload:`, uploadError);
+      } else {
+        const totalCount = hasExisting
+          ? `(${newEntries} new + existing)`
+          : `(${newEntries} entries)`;
+        console.log(`${logPrefix} Changelog: Saved to streams/${changelogStoragePath} ${totalCount}`);
+      }
+    } catch (changelogError) {
+      console.error(`${logPrefix} Changelog: Merge/upload failed (non-fatal):`, changelogError);
+    } finally {
+      this.cleanupTempFile(tempExistingPath);
+      this.cleanupTempFile(tempOutputPath);
     }
   }
   
