@@ -928,445 +928,254 @@ export class OutboundProcessor {
               console.warn(`${logPrefix} Changelog: Failed to record TRUNCATE_RELOAD entries:`, clErr);
             }
           } else {
-            // Upsert mode: Use change detection with parquet snapshots (DEFAULT)
-            console.log(`${logPrefix} Using change detection approach for MySQL upsert`);
+            // PK-based reconciliation: Read MySQL target into local DuckDB, compare by primary key
+            // Only INSERT missing rows and UPDATE existing rows — NEVER DELETE
+            console.log(`${logPrefix} Using PK-based reconciliation (INSERT + UPDATE only, no deletes)`);
+            console.log(`${logPrefix} Primary keys: ${effectiveUpsertKeys.join(', ')}`);
             
-            // Try to download previous snapshot
-            const snapshotPath = `${tenantId}/${streamId}_snapshot.parquet`;
-            let hasPreviousSnapshot = false;
-            let tempPreviousPath: string | null = null;
+            // === Step 0: Read existing MySQL target data into LOCAL DuckDB temp table ===
+            // This avoids unreliable cross-engine JOINs — we pull MySQL data into DuckDB memory first
+            console.log(`${logPrefix} Step 0: Reading existing target data from MySQL into local DuckDB...`);
+            
+            const pkColumnsList = effectiveUpsertKeys.map(k => `"${k}"`).join(', ');
             
             try {
-              console.log(`${logPrefix} Checking for previous snapshot: streams/${snapshotPath}`);
-              const { data: snapshotData } = await this.supabase
-                .storage
-                .from('streams')
-                .download(snapshotPath);
+              await connection.run(`
+                CREATE TEMP TABLE existing_target_pks AS 
+                SELECT ${pkColumnsList} FROM ${fullTableName}
+              `);
+              const existingCountResult = await connection.runAndReadAll(`SELECT COUNT(*) FROM existing_target_pks`);
+              const existingCount = Number(existingCountResult.getRows()[0]?.[0] || 0);
+              console.log(`${logPrefix} Loaded ${existingCount} existing PKs from MySQL target into local DuckDB`);
               
-              if (snapshotData) {
-                tempPreviousPath = this.getTempFilePath('snapshot', `${streamId}_previous.parquet`);
-                const snapshotBuffer = Buffer.from(await snapshotData.arrayBuffer());
-                fs.writeFileSync(tempPreviousPath, snapshotBuffer);
-                hasPreviousSnapshot = true;
-                console.log(`${logPrefix} Previous snapshot found: streams/${snapshotPath}`);
-                console.log(`${logPrefix} Previous snapshot downloaded to: ${tempPreviousPath}`);
+              // DIAGNOSTIC: Check if specific record exists in local copy
+              try {
+                const diagCheck = await connection.runAndReadAll(
+                  `SELECT COUNT(*) FROM existing_target_pks WHERE CAST("jobNumber" AS VARCHAR) = '2610111A'`
+                );
+                console.log(`${logPrefix} DIAGNOSTIC: "2610111A" in local copy of MySQL PKs? ${diagCheck.getRows()[0]?.[0]} rows`);
+              } catch (e) {
+                console.log(`${logPrefix} DIAGNOSTIC: Could not check for specific record in local PKs`);
               }
-            } catch (e) {
-              console.log(`${logPrefix} No previous snapshot found at: streams/${snapshotPath}`);
+            } catch (readErr) {
+              console.error(`${logPrefix} Failed to read MySQL target data:`, readErr);
+              throw new Error(`Cannot read existing target data from MySQL: ${readErr}`);
             }
             
-            if (hasPreviousSnapshot && tempPreviousPath) {
-              // Perform change detection
-              const escapedPrevious = tempPreviousPath.replace(/'/g, "''");
+            // === Step 1: Find and INSERT rows missing from target (using LOCAL comparison) ===
+            console.log(`${logPrefix} Step 1: Finding rows missing from target (local PK comparison)...`);
+            
+            const localPkJoinConditions = effectiveUpsertKeys.map(k => 
+              `source_data."${k}" = existing_pks."${k}"`
+            ).join(' AND ');
+            
+            const simpleColumnListFromSource = exportColumns.map(col => `source_data."${col}"`).join(', ');
+            
+            const missingRowsQuery = `
+              SELECT ${simpleColumnListFromSource}
+              FROM (${deduplicatedQuery}) source_data
+              LEFT JOIN existing_target_pks existing_pks
+                ON ${localPkJoinConditions}
+              WHERE existing_pks."${effectiveUpsertKeys[0]}" IS NULL
+            `;
+            
+            const missingCountResult = await connection.runAndReadAll(
+              `SELECT COUNT(*) FROM (${missingRowsQuery})`
+            );
+            const missingCount = Number(missingCountResult.getRows()[0]?.[0] || 0);
+            console.log(`${logPrefix} Found ${missingCount} rows missing from target`);
+            
+            let insertedCount = 0;
+            if (missingCount > 0) {
+              insertedCount = await this.safeInsertRows(
+                connection,
+                fullTableName,
+                simpleColumnList,
+                exportColumns,
+                missingRowsQuery,
+                missingCount,
+                logPrefix,
+                'INSERT missing'
+              );
               
-              // Load both parquets
-              console.log(`${logPrefix} Comparing current vs previous data...`);
-              
-              // Identify new rows (in current but not in previous)
-              const pkJoinConditions = effectiveUpsertKeys.map(k => 
-                `current."${k}" = previous."${k}"`
-              ).join(' AND ');
-              
-              // Qualify column names with table alias to avoid ambiguity
-              // Also include $_ref if it exists (needed for UPDATE detection)
-              const simpleColumnListQualified = exportColumns.map(col => `current."${col}"`).join(', ');
-              const simpleColumnListQualifiedWithRef = hasRefColumn
-                ? `${simpleColumnListQualified}, current."${this.ROW_HASH_COLUMN}"`
-                : simpleColumnListQualified;
-              
-              const newRowsQuery = `
-                SELECT ${simpleColumnListQualified}
-                FROM (${deduplicatedQuery}) current
-                LEFT JOIN read_parquet('${escapedPrevious}') previous
-                  ON ${pkJoinConditions}
-                WHERE previous."${effectiveUpsertKeys[0]}" IS NULL
-              `;
-              
-              const newRowsCount = await connection.runAndReadAll(`SELECT COUNT(*) FROM (${newRowsQuery})`);
-              const newCount = Number(newRowsCount.getRows()[0]?.[0] || 0);
-              console.log(`${logPrefix} Found ${newCount} new rows to INSERT`);
-              
-              if (newCount > 0) {
-                // Use simple INSERT without ON CONFLICT (since DuckDB can't see MySQL constraints)
-                // If duplicates exist, MySQL will reject them but we'll catch and ignore the error
-                try {
-                  await connection.run(`
-                    INSERT INTO ${fullTableName} (${simpleColumnList})
-                    ${newRowsQuery}
-                  `);
-                  console.log(`${logPrefix} Inserted ${newCount} new rows`);
-                } catch (insertError: any) {
-                  // Check if it's a duplicate key error (expected when snapshot and MySQL are out of sync)
-                  if (insertError.message && insertError.message.includes('Duplicate entry')) {
-                    console.log(`${logPrefix} Some rows already existed in MySQL (snapshot out of sync) - skipping duplicates`);
-                    console.log(`${logPrefix} Note: Some of the ${newCount} "new" rows may have already existed`);
-                  } else {
-                    // Not a duplicate error, re-throw
-                    throw insertError;
-                  }
-                }
-                
-                // CHANGELOG: Record new rows as INSERT
+              // CHANGELOG: Record inserted rows
+              if (insertedCount > 0) {
                 try {
                   await connection.run(`
                     INSERT INTO changelog_staging
-                    SELECT ${simpleColumnListQualified},
+                    SELECT ${simpleColumnListShared},
                            'INSERT' AS "$_changelog_operation",
                            '${syncTimestamp}' AS "$_changelog_timestamp",
                            '${escapedJobId}' AS "$_changelog_job_id",
                            'new' AS "$_changelog_row_type"
-                    FROM (${newRowsQuery}) _new
+                    FROM (${missingRowsQuery}) _ins
                   `);
                   changelogHasEntries = true;
-                  console.log(`${logPrefix} Changelog: Recorded ${newCount} INSERT entries`);
+                  console.log(`${logPrefix} Changelog: Recorded ${insertedCount} INSERT entries`);
                 } catch (clErr) {
                   console.warn(`${logPrefix} Changelog: Failed to record INSERT entries:`, clErr);
                 }
               }
+            }
+            
+            // === Step 2: UPDATE existing rows with latest source data ===
+            // Find rows that exist in BOTH source and target (by PK), then update all non-PK columns
+            // No hash comparison — just update everything that exists to ensure data is fresh
+            console.log(`${logPrefix} Step 2: Finding existing rows to update (PK match, no hash)...`);
+            
+            const existingRowsQuery = `
+              SELECT ${simpleColumnListFromSource}
+              FROM (${deduplicatedQuery}) source_data
+              INNER JOIN existing_target_pks existing_pks
+                ON ${localPkJoinConditions}
+            `;
+            
+            const existingCountResult2 = await connection.runAndReadAll(
+              `SELECT COUNT(*) FROM (${existingRowsQuery})`
+            );
+            const existingMatchCount = Number(existingCountResult2.getRows()[0]?.[0] || 0);
+            console.log(`${logPrefix} Found ${existingMatchCount} rows that exist in both source and target`);
+            
+            let updatedCount = 0;
+            if (existingMatchCount > 0) {
+              // Stage the rows for UPDATE
+              console.log(`${logPrefix} Staging ${existingMatchCount} rows for update...`);
+              await connection.run(`CREATE TEMP TABLE updates_staging AS ${existingRowsQuery}`);
               
-              // Identify updated rows (exist in both, but values differ)
-              // Use $_ref hash column if available for efficient comparison
-              let updatedRowsQuery: string;
+              const nonPkColumns = exportColumns.filter(col => !effectiveUpsertKeys.includes(col));
               
-              if (hasRefColumn) {
-                updatedRowsQuery = `
-                  SELECT ${simpleColumnListQualified}
-                  FROM (${deduplicatedQuery}) current
-                  INNER JOIN read_parquet('${escapedPrevious}') previous
-                    ON ${pkJoinConditions}
-                  WHERE current."${this.ROW_HASH_COLUMN}" != previous."${this.ROW_HASH_COLUMN}"
-                `;
-              } else {
-                // Fallback: compare all non-PK columns (less efficient)
-                const nonPkColumns = exportColumns.filter(col => !effectiveUpsertKeys.includes(col));
-                const valueComparisons = nonPkColumns.map(col =>
-                  `(current."${col}" IS DISTINCT FROM previous."${col}")`
-                ).join(' OR ');
+              // Read rows from staging and execute individual UPDATEs
+              const updatedRows = await connection.runAndReadAll(`SELECT * FROM updates_staging`);
+              const rows = updatedRows.getRows();
+              
+              const pkIndexes = effectiveUpsertKeys.map(k => exportColumns.indexOf(k));
+              const nonPkIndexes = nonPkColumns.map(col => exportColumns.indexOf(col));
+              
+              console.log(`${logPrefix} Executing ${rows.length} individual UPDATE statements...`);
+              
+              let successfulUpdates = 0;
+              let updateErrors = 0;
+              let consecutiveConnectionErrors = 0;
+              const MAX_RECONNECT_ATTEMPTS = 3;
+              
+              for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
                 
-                updatedRowsQuery = `
-                  SELECT ${simpleColumnListQualified}
-                  FROM (${deduplicatedQuery}) current
-                  INNER JOIN read_parquet('${escapedPrevious}') previous
-                    ON ${pkJoinConditions}
-                  WHERE ${valueComparisons}
-                `;
-              }
-              
-              const updatedRowsCount = await connection.runAndReadAll(`SELECT COUNT(*) FROM (${updatedRowsQuery})`);
-              const updateCount = Number(updatedRowsCount.getRows()[0]?.[0] || 0);
-              console.log(`${logPrefix} Found ${updateCount} rows to UPDATE`);
-              
-              if (updateCount > 0) {
-                // Create a temporary staging table for updates
-                console.log(`${logPrefix} Creating staging table for ${updateCount} updates...`);
-                await connection.run(`CREATE TEMP TABLE updates_staging AS ${updatedRowsQuery}`);
+                const whereConditions = effectiveUpsertKeys.map((k, pkIdx) => {
+                  const val = row[pkIndexes[pkIdx]];
+                  if (val === null || val === undefined) return `"${k}" IS NULL`;
+                  return `"${k}" = '${String(val).replace(/'/g, "''")}'`;
+                }).join(' AND ');
                 
-                // Use UPDATE FROM pattern
-                const nonPkColumns = exportColumns.filter(col => !effectiveUpsertKeys.includes(col));
-                const updateSetClause = nonPkColumns.map(col => `"${col}" = updates_staging."${col}"`).join(', ');
-                const whereClause = effectiveUpsertKeys.map(k => `${fullTableName}."${k}" = updates_staging."${k}"`).join(' AND ');
+                const setStatements = nonPkColumns.map((col, idx) => {
+                  const val = row[nonPkIndexes[idx]];
+                  if (val === null || val === undefined) return `"${col}" = NULL`;
+                  if (typeof val === 'number' || typeof val === 'bigint') return `"${col}" = ${val}`;
+                  if (val instanceof Date) return `"${col}" = '${val.toISOString()}'`;
+                  return `"${col}" = '${String(val).replace(/'/g, "''")}'`;
+                }).join(', ');
                 
                 try {
-                  // Try UPDATE FROM syntax (may not be supported by MySQL)
                   await connection.run(`
                     UPDATE ${fullTableName}
-                    SET ${updateSetClause}
-                    FROM updates_staging
-                    WHERE ${whereClause}
+                    SET ${setStatements}
+                    WHERE ${whereConditions}
                   `);
-                  console.log(`${logPrefix} Updated ${updateCount} rows via UPDATE FROM`);
-                } catch (e) {
-                  // UPDATE FROM not supported - use individual UPDATE statements
-                  // The MySQL connector doesn't support complex CASE-based bulk updates
-                  console.log(`${logPrefix} UPDATE FROM not supported, using individual UPDATE statements...`);
-                  const updatedRows = await connection.runAndReadAll(`SELECT * FROM updates_staging`);
-                  const rows = updatedRows.getRows();
+                  successfulUpdates++;
+                  consecutiveConnectionErrors = 0; // Reset on success
+                } catch (updateError: any) {
+                  updateErrors++;
+                  const errMsg = updateError?.message || '';
                   
-                  // Execute individual UPDATE statements for each row
-                  // Less efficient but works within MySQL connector limitations
-                  const pkIndexes = effectiveUpsertKeys.map(k => exportColumns.indexOf(k));
-                  const nonPkIndexes = nonPkColumns.map(col => exportColumns.indexOf(col));
+                  // Check if this is a connection loss error
+                  const isConnectionLost = errMsg.includes('Lost connection') || errMsg.includes('gone away');
                   
-                  let successfulUpdates = 0;
-                  for (let i = 0; i < rows.length; i++) {
-                    const row = rows[i];
-                    
-                    // Build WHERE clause from primary key values
-                    const whereConditions = effectiveUpsertKeys.map((k, pkIdx) => {
-                      const val = row[pkIndexes[pkIdx]];
-                      const valStr = val === null ? 'NULL' : `'${String(val).replace(/'/g, "''")}'`;
-                      return `"${k}" = ${valStr}`;
-                    }).join(' AND ');
-                    
-                    // Build SET clause from non-PK columns
-                    const setStatements = nonPkColumns.map((col, idx) => {
-                      const val = row[nonPkIndexes[idx]];
-                      const valStr = val === null ? 'NULL' : `'${String(val).replace(/'/g, "''")}'`;
-                      return `"${col}" = ${valStr}`;
-                    }).join(', ');
-                    
-                    const updateQuery = `
-                      UPDATE ${fullTableName}
-                      SET ${setStatements}
-                      WHERE ${whereConditions}
-                    `;
-                    
-                    try {
-                      await connection.run(updateQuery);
-                      successfulUpdates++;
-                      
-                      // Log progress every 50 rows
-                      if ((i + 1) % 50 === 0 || (i + 1) === rows.length) {
-                        console.log(`${logPrefix} Updated ${i + 1}/${rows.length} rows...`);
-                      }
-                    } catch (updateError) {
-                      console.error(`${logPrefix} Failed to update row ${i + 1}:`, updateError);
-                      // Continue with other updates
-                    }
+                  // Log first 5 errors and any connection errors
+                  if (updateErrors <= 5 || isConnectionLost) {
+                    const pkVals = effectiveUpsertKeys.map((k, idx) => `${k}=${row[pkIndexes[idx]]}`).join(', ');
+                    console.warn(`${logPrefix} UPDATE failed for row ${i + 1} (${pkVals}): ${errMsg.substring(0, 150)}`);
                   }
                   
-                  console.log(`${logPrefix} Updated ${successfulUpdates}/${rows.length} rows via individual UPDATE statements`);
+                  // If we get connection errors, attempt to reconnect and retry
+                  if (isConnectionLost) {
+                    consecutiveConnectionErrors++;
+                    console.warn(`${logPrefix} MySQL connection lost at row ${i + 1} (reconnect attempt ${consecutiveConnectionErrors}/${MAX_RECONNECT_ATTEMPTS}) - attempting reconnect...`);
+                    
+                    if (consecutiveConnectionErrors >= MAX_RECONNECT_ATTEMPTS) {
+                      console.error(`${logPrefix} MySQL connection lost ${MAX_RECONNECT_ATTEMPTS} times consecutively - aborting remaining updates`);
+                      console.error(`${logPrefix} Completed ${successfulUpdates} of ${rows.length} updates before giving up`);
+                      break;
+                    }
+                    
+                    // Attempt to reconnect: detach and re-attach MySQL
+                    try {
+                      try { await connection.run(`DETACH ${alias}`); } catch (_detachErr) { /* ignore detach errors */ }
+                      await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s for MySQL to recover
+                      await connection.run(`ATTACH '${connStr}' AS ${alias} (TYPE ${dbType})`);
+                      console.log(`${logPrefix} Reconnected to MySQL successfully - retrying row ${i + 1} and continuing...`);
+                      i--; // Retry this same row on next iteration
+                      continue;
+                    } catch (reconnectError: any) {
+                      console.error(`${logPrefix} Reconnect failed: ${reconnectError?.message || reconnectError}`);
+                      console.error(`${logPrefix} Completed ${successfulUpdates} of ${rows.length} updates before reconnect failure`);
+                      break;
+                    }
+                  }
                 }
                 
-                // Clean up staging table
-                try {
-                  await connection.run(`DROP TABLE updates_staging`);
-                } catch (e) {
-                  console.warn(`${logPrefix} Failed to drop staging table:`, e);
+                // Log progress every 100 rows
+                if ((i + 1) % 100 === 0 || (i + 1) === rows.length) {
+                  console.log(`${logPrefix} UPDATE progress: ${i + 1}/${rows.length} (success: ${successfulUpdates}, errors: ${updateErrors})`);
+                }
+                
+                // Throttle: small delay every 200 rows to avoid overwhelming MySQL
+                if ((i + 1) % 200 === 0) {
+                  await new Promise(resolve => setTimeout(resolve, 100));
                 }
               }
               
-              // CHANGELOG: Record updated rows (both old and new values)
-              if (updateCount > 0) {
+              updatedCount = successfulUpdates;
+              console.log(`${logPrefix} Updates complete: ${successfulUpdates} succeeded, ${updateErrors} failed`);
+              
+              // CHANGELOG: Record updated rows
+              if (successfulUpdates > 0) {
                 try {
-                  // Record NEW values for updated rows
                   await connection.run(`
                     INSERT INTO changelog_staging
-                    SELECT ${simpleColumnListQualified},
+                    SELECT ${simpleColumnListShared},
                            'UPDATE' AS "$_changelog_operation",
                            '${syncTimestamp}' AS "$_changelog_timestamp",
                            '${escapedJobId}' AS "$_changelog_job_id",
                            'new' AS "$_changelog_row_type"
-                    FROM (${updatedRowsQuery}) _upd_new
+                    FROM updates_staging
                   `);
-                  
-                  // Record PREVIOUS (old) values for updated rows
-                  const previousColumnListQualified = exportColumns.map(col => `previous."${col}"`).join(', ');
-                  let oldRowsQuery: string;
-                  if (hasRefColumn) {
-                    oldRowsQuery = `
-                      SELECT ${previousColumnListQualified}
-                      FROM (${deduplicatedQuery}) current
-                      INNER JOIN read_parquet('${escapedPrevious}') previous
-                        ON ${pkJoinConditions}
-                      WHERE current."${this.ROW_HASH_COLUMN}" != previous."${this.ROW_HASH_COLUMN}"
-                    `;
-                  } else {
-                    const nonPkCols = exportColumns.filter(col => !effectiveUpsertKeys.includes(col));
-                    const valComps = nonPkCols.map(col =>
-                      `(current."${col}" IS DISTINCT FROM previous."${col}")`
-                    ).join(' OR ');
-                    oldRowsQuery = `
-                      SELECT ${previousColumnListQualified}
-                      FROM (${deduplicatedQuery}) current
-                      INNER JOIN read_parquet('${escapedPrevious}') previous
-                        ON ${pkJoinConditions}
-                      WHERE ${valComps}
-                    `;
-                  }
-                  
-                  await connection.run(`
-                    INSERT INTO changelog_staging
-                    SELECT ${exportColumns.map(col => `"${col}"`).join(', ')},
-                           'UPDATE' AS "$_changelog_operation",
-                           '${syncTimestamp}' AS "$_changelog_timestamp",
-                           '${escapedJobId}' AS "$_changelog_job_id",
-                           'previous' AS "$_changelog_row_type"
-                    FROM (${oldRowsQuery}) _upd_old
-                  `);
-                  
                   changelogHasEntries = true;
-                  console.log(`${logPrefix} Changelog: Recorded ${updateCount} UPDATE entries (old + new)`);
+                  console.log(`${logPrefix} Changelog: Recorded UPDATE entries`);
                 } catch (clErr) {
                   console.warn(`${logPrefix} Changelog: Failed to record UPDATE entries:`, clErr);
                 }
               }
               
-              console.log(`${logPrefix} Change detection complete: ${newCount} inserted, ${updateCount} updated`);
-              
-              // Gap fill: Check for rows in source that are missing from the MySQL target
-              // This catches rows that were missed by previous bootstrap bugs or failed inserts
-              if (effectiveUpsertKeys.length > 0) {
-                try {
-                  console.log(`${logPrefix} Gap fill: Checking for rows missing from target table...`);
-                  
-                  const gapFillJoinConditions = effectiveUpsertKeys.map(k => 
-                    `source_data."${k}" = existing."${k}"`
-                  ).join(' AND ');
-                  
-                  const simpleColumnListFromSource = exportColumns.map(col => `source_data."${col}"`).join(', ');
-                  
-                  const missingRowsQuery = `
-                    SELECT ${simpleColumnListFromSource}
-                    FROM (${deduplicatedQuery}) source_data
-                    LEFT JOIN ${fullTableName} existing
-                      ON ${gapFillJoinConditions}
-                    WHERE existing."${effectiveUpsertKeys[0]}" IS NULL
-                  `;
-                  
-                  const missingCountResult = await connection.runAndReadAll(
-                    `SELECT COUNT(*) FROM (${missingRowsQuery})`
-                  );
-                  const missingCount = Number(missingCountResult.getRows()[0]?.[0] || 0);
-                  
-                  if (missingCount > 0) {
-                    console.log(`${logPrefix} Gap fill: Found ${missingCount} rows in source missing from target - inserting...`);
-                    try {
-                      await connection.run(`
-                        INSERT INTO ${fullTableName} (${simpleColumnList})
-                        ${missingRowsQuery}
-                      `);
-                      console.log(`${logPrefix} Gap fill: Inserted ${missingCount} missing rows into target`);
-                      
-                      // CHANGELOG: Record gap fill rows
-                      try {
-                        await connection.run(`
-                          INSERT INTO changelog_staging
-                          SELECT ${simpleColumnListFromSource},
-                                 'GAP_FILL' AS "$_changelog_operation",
-                                 '${syncTimestamp}' AS "$_changelog_timestamp",
-                                 '${escapedJobId}' AS "$_changelog_job_id",
-                                 'new' AS "$_changelog_row_type"
-                          FROM (${missingRowsQuery}) _gf
-                        `);
-                        changelogHasEntries = true;
-                        console.log(`${logPrefix} Changelog: Recorded ${missingCount} GAP_FILL entries`);
-                      } catch (clErr) {
-                        console.warn(`${logPrefix} Changelog: Failed to record GAP_FILL entries:`, clErr);
-                      }
-                    } catch (insertError: any) {
-                      if (insertError.message && insertError.message.includes('Duplicate entry')) {
-                        console.log(`${logPrefix} Gap fill: Some rows already existed (race condition) - skipping duplicates`);
-                      } else {
-                        throw insertError;
-                      }
-                    }
-                  } else {
-                    console.log(`${logPrefix} Gap fill: All source rows exist in target - no gaps found`);
-                  }
-                } catch (gapFillError: any) {
-                  console.error(`${logPrefix} Gap fill check failed (non-fatal):`, gapFillError.message);
-                }
-              }
-              
-              // Cleanup previous snapshot temp file
-              this.cleanupTempFile(tempPreviousPath);
-            } else {
-              // No previous snapshot - bootstrap mode
-              // Insert only rows that don't already exist in the target (safe for existing data)
-              console.log(`${logPrefix} No snapshot found - bootstrapping with safe "insert missing rows" approach`);
-              
-              if (effectiveUpsertKeys.length > 0) {
-                // Use primary keys to detect which rows are missing from the target
-                console.log(`${logPrefix} Checking target table for existing rows using keys: ${effectiveUpsertKeys.join(', ')}`);
-                
-                try {
-                  // Query: SELECT from source LEFT JOIN target ON PKs WHERE target PK IS NULL
-                  const pkJoinConditions = effectiveUpsertKeys.map(k => 
-                    `source_data."${k}" = existing."${k}"`
-                  ).join(' AND ');
-                  
-                  const simpleColumnListFromSource = exportColumns.map(col => `source_data."${col}"`).join(', ');
-                  
-                  const missingRowsQuery = `
-                    SELECT ${simpleColumnListFromSource}
-                    FROM (${deduplicatedQuery}) source_data
-                    LEFT JOIN ${fullTableName} existing
-                      ON ${pkJoinConditions}
-                    WHERE existing."${effectiveUpsertKeys[0]}" IS NULL
-                  `;
-                  
-                  // Count missing rows first
-                  const missingCountResult = await connection.runAndReadAll(
-                    `SELECT COUNT(*) FROM (${missingRowsQuery})`
-                  );
-                  const missingCount = Number(missingCountResult.getRows()[0]?.[0] || 0);
-                  
-                  console.log(`${logPrefix} Bootstrap: Found ${missingCount} rows missing from target (out of source data)`);
-                  
-                  if (missingCount > 0) {
-                    try {
-                      await connection.run(`
-                        INSERT INTO ${fullTableName} (${simpleColumnList})
-                        ${missingRowsQuery}
-                      `);
-                      console.log(`${logPrefix} Bootstrap: Inserted ${missingCount} missing rows into target`);
-                      
-                      // CHANGELOG: Record bootstrap rows
-                      try {
-                        await connection.run(`
-                          INSERT INTO changelog_staging
-                          SELECT ${simpleColumnListFromSource},
-                                 'BOOTSTRAP' AS "$_changelog_operation",
-                                 '${syncTimestamp}' AS "$_changelog_timestamp",
-                                 '${escapedJobId}' AS "$_changelog_job_id",
-                                 'new' AS "$_changelog_row_type"
-                          FROM (${missingRowsQuery}) _bs
-                        `);
-                        changelogHasEntries = true;
-                        console.log(`${logPrefix} Changelog: Recorded ${missingCount} BOOTSTRAP entries`);
-                      } catch (clErr) {
-                        console.warn(`${logPrefix} Changelog: Failed to record BOOTSTRAP entries:`, clErr);
-                      }
-                    } catch (insertError: any) {
-                      if (insertError.message && insertError.message.includes('Duplicate entry')) {
-                        console.log(`${logPrefix} Bootstrap: Some rows already existed (race condition) - skipping duplicates`);
-                      } else {
-                        throw insertError;
-                      }
-                    }
-                  } else {
-                    console.log(`${logPrefix} Bootstrap: All source rows already exist in target - nothing to insert`);
-                  }
-                } catch (bootstrapError: any) {
-                  console.error(`${logPrefix} Bootstrap insert failed:`, bootstrapError.message);
-                  console.log(`${logPrefix} Falling back to saving snapshot only (data will sync on next run with changes)`);
-                }
-              } else {
-                // No primary keys defined - can't safely determine what's missing
-                console.log(`${logPrefix} No primary keys defined - skipping bootstrap INSERT to avoid duplicates`);
-                console.log(`${logPrefix} Configure primaryKey or upsertKeys in target_config to enable safe bootstrap`);
-              }
+              // Clean up staging
+              try {
+                await connection.run(`DROP TABLE IF EXISTS updates_staging`);
+              } catch (e) { /* ignore */ }
             }
             
-            // Save current parquet as the new snapshot for next sync
-            console.log(`${logPrefix} Saving current snapshot for next sync...`);
-            const snapshotBuffer = fs.readFileSync(parquetPath);
-            const { error: uploadError } = await this.supabase
-              .storage
-              .from('streams')
-              .upload(snapshotPath, snapshotBuffer, {
-                contentType: 'application/x-parquet',
-                upsert: true,
-              });
+            // Clean up local PKs table
+            try {
+              await connection.run(`DROP TABLE IF EXISTS existing_target_pks`);
+            } catch (e) { /* ignore */ }
             
-            if (uploadError) {
-              console.warn(`${logPrefix} Failed to save snapshot:`, uploadError);
-            } else {
-              console.log(`${logPrefix} Current snapshot saved to: streams/${snapshotPath}`);
-            }
+            // === Summary ===
+            console.log(`${logPrefix} ═══════════════════════════════════════════`);
+            console.log(`${logPrefix} Reconciliation complete:`);
+            console.log(`${logPrefix}   Inserted: ${insertedCount} new rows`);
+            console.log(`${logPrefix}   Updated:  ${updatedCount} existing rows`);
+            console.log(`${logPrefix}   Deleted:  0 (never deletes)`);
+            console.log(`${logPrefix} ═══════════════════════════════════════════`);
             
-            // Summary
-            console.log(`${logPrefix} === Snapshot Summary ===`);
-            if (hasPreviousSnapshot) {
-              console.log(`${logPrefix} Previous snapshot: streams/${snapshotPath} (used for comparison)`);
-            } else {
-              console.log(`${logPrefix} Previous snapshot: none (bootstrap mode)`);
-            }
-            console.log(`${logPrefix} Current snapshot: streams/${snapshotPath} (saved for next sync)`);
-            console.log(`${logPrefix} Current parquet source: ${parquetPath}`);
-            
-            console.log(`${logPrefix} Upsert complete (change detection)`);
+            console.log(`${logPrefix} PK-based reconciliation complete`);
           }
         }
       } else {
@@ -1669,6 +1478,140 @@ export class OutboundProcessor {
     } finally {
       this.cleanupTempFile(tempExistingPath);
       this.cleanupTempFile(tempOutputPath);
+    }
+  }
+  
+  /**
+   * Safely insert rows into the target database with row-by-row fallback.
+   * 
+   * Attempts a fast bulk INSERT first. If it fails due to duplicate entries,
+   * falls back to inserting rows one-by-one so that a single problematic row
+   * doesn't prevent all other rows from being inserted.
+   * 
+   * @returns Number of successfully inserted rows
+   */
+  private async safeInsertRows(
+    connection: any,
+    fullTableName: string,
+    simpleColumnList: string,
+    exportColumns: string[],
+    sourceQuery: string,
+    rowCount: number,
+    logPrefix: string,
+    operationLabel: string
+  ): Promise<number> {
+    // FORCED ROW-BY-ROW MODE: Always insert individually for maximum visibility
+    console.log(`${logPrefix} ${operationLabel}: Using row-by-row insert for ${rowCount} rows (forced mode for diagnostics)...`);
+    
+    // Stage the rows in a temp table first
+    const stagingTable = `_safe_insert_staging_${Date.now()}`;
+    try {
+      await connection.run(`CREATE TEMP TABLE "${stagingTable}" AS ${sourceQuery}`);
+    } catch (stageError) {
+      console.error(`${logPrefix} ${operationLabel}: Failed to create staging table:`, stageError);
+      return 0;
+    }
+    
+    // Trace column for diagnostic logging
+    const TRACE_COLUMN = 'jobNumber';
+    const TRACE_VALUE = '2610111A';
+    const traceColIdx = exportColumns.indexOf(TRACE_COLUMN);
+    
+    try {
+      const allRows = await connection.runAndReadAll(`SELECT * FROM "${stagingTable}"`);
+      const rows = allRows.getRows();
+      
+      console.log(`${logPrefix} ${operationLabel}: Staging table has ${rows.length} rows to insert`);
+      
+      // Log all PK values for first 20 rows
+      const pkIdx = exportColumns.indexOf(exportColumns[0]);
+      console.log(`${logPrefix} ${operationLabel}: First 20 PK values: ${rows.slice(0, 20).map((r: any) => r[pkIdx]).join(', ')}`);
+      
+      // Check if traced record is in staging
+      if (traceColIdx >= 0) {
+        const tracedRow = rows.find((r: any) => String(r[traceColIdx]) === TRACE_VALUE);
+        if (tracedRow) {
+          console.log(`${logPrefix} DIAGNOSTIC: "${TRACE_VALUE}" IS in the ${operationLabel} staging table! Row data:`, 
+            JSON.stringify(exportColumns.reduce((obj: any, col, idx) => { obj[col] = tracedRow[idx]; return obj; }, {}), null, 2));
+        } else {
+          console.log(`${logPrefix} DIAGNOSTIC: "${TRACE_VALUE}" is NOT in the ${operationLabel} staging table (${rows.length} total rows)`);
+          // Check if it's present with different casing/whitespace
+          const similarRows = rows.filter((r: any) => String(r[traceColIdx]).trim().toUpperCase().includes('2610111'));
+          if (similarRows.length > 0) {
+            console.log(`${logPrefix} DIAGNOSTIC: Found ${similarRows.length} similar rows containing "2610111":`, 
+              similarRows.map((r: any) => `"${r[traceColIdx]}"`).join(', '));
+          }
+        }
+      } else {
+        console.log(`${logPrefix} DIAGNOSTIC: Column "${TRACE_COLUMN}" not found in exportColumns. Available: ${exportColumns.slice(0, 10).join(', ')}`);
+      }
+      
+      let successCount = 0;
+      let skipCount = 0;
+      let errorCount = 0;
+      
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const isTracedRow = traceColIdx >= 0 && String(row[traceColIdx]) === TRACE_VALUE;
+        
+        // Build VALUES for this row
+        const values = exportColumns.map((col, colIdx) => {
+          const val = row[colIdx];
+          if (val === null || val === undefined) return 'NULL';
+          if (typeof val === 'number' || typeof val === 'bigint') return String(val);
+          if (val instanceof Date) return `'${val.toISOString()}'`;
+          return `'${String(val).replace(/'/g, "''")}'`;
+        }).join(', ');
+        
+        const insertSQL = `INSERT INTO ${fullTableName} (${simpleColumnList}) VALUES (${values})`;
+        
+        // Log traced row's SQL
+        if (isTracedRow) {
+          console.log(`${logPrefix} DIAGNOSTIC: Attempting INSERT for "${TRACE_VALUE}" (row ${i + 1}/${rows.length})`);
+          console.log(`${logPrefix} DIAGNOSTIC: SQL: ${insertSQL.substring(0, 500)}...`);
+        }
+        
+        try {
+          await connection.run(insertSQL);
+          successCount++;
+          
+          if (isTracedRow) {
+            console.log(`${logPrefix} DIAGNOSTIC: "${TRACE_VALUE}" INSERT SUCCEEDED!`);
+          }
+        } catch (rowError: any) {
+          const rowMsg = rowError?.message || '';
+          
+          if (isTracedRow) {
+            console.error(`${logPrefix} DIAGNOSTIC: "${TRACE_VALUE}" INSERT FAILED! Full error:`, rowMsg);
+          }
+          
+          if (rowMsg.includes('Duplicate entry') || rowMsg.includes('duplicate key')) {
+            skipCount++;
+            if (isTracedRow) {
+              console.log(`${logPrefix} DIAGNOSTIC: "${TRACE_VALUE}" was a duplicate entry`);
+            }
+          } else {
+            errorCount++;
+            // Log ALL non-duplicate errors (not just first 3)
+            const pkValues = exportColumns.slice(0, 3).map((col, idx) => `${col}=${row[idx]}`).join(', ');
+            console.warn(`${logPrefix} ${operationLabel}: Row ${i + 1} FAILED (${pkValues}): ${rowMsg.substring(0, 200)}`);
+          }
+        }
+        
+        // Log progress every 50 rows
+        if ((i + 1) % 50 === 0 || (i + 1) === rows.length) {
+          console.log(`${logPrefix} ${operationLabel}: Progress ${i + 1}/${rows.length} (inserted: ${successCount}, skipped: ${skipCount}, errors: ${errorCount})`);
+        }
+      }
+      
+      console.log(`${logPrefix} ${operationLabel}: Row-by-row complete - inserted: ${successCount}, duplicates skipped: ${skipCount}, errors: ${errorCount}`);
+      return successCount;
+    } finally {
+      try {
+        await connection.run(`DROP TABLE IF EXISTS "${stagingTable}"`);
+      } catch (e) {
+        // Ignore cleanup errors
+      }
     }
   }
   
